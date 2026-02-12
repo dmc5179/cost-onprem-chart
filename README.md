@@ -290,3 +290,4 @@ For issues and questions:
 - **Issues**: [GitHub Issues](https://github.com/insights-onprem/cost-onprem-chart/issues)
 - **Documentation**: [Complete Documentation Index](docs/README.md)
 - **Scripts**: [Automation Scripts Reference](scripts/README.md)
+
