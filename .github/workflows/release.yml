@@ -80,6 +80,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.7.0
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+
       - name: Update latest release
         run: |
           echo "Release ${{ steps.version.outputs.tag }} created successfully!"
