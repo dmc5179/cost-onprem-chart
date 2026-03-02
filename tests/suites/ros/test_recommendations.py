@@ -180,8 +180,8 @@ class TestRecommendationsAPI:
             "Response should contain 'data' or 'recommendations' field"
         )
         
-        # Verify limit is respected
-        items = data.get("data") or data.get("recommendations") or []
+        # Verify limit is respected (use 'in' check to handle empty lists correctly)
+        items = data["data"] if "data" in data else data.get("recommendations", [])
         if isinstance(items, list):
             assert len(items) <= limit, (
                 f"Response returned {len(items)} items, expected <= {limit}"
@@ -252,8 +252,8 @@ class TestRecommendationsAPI:
             "Response should include pagination metadata ('meta' or 'links')"
         )
         
-        # Verify limit is respected
-        items = data.get("data") or data.get("recommendations") or []
+        # Verify limit is respected (use 'in' check to handle empty lists correctly)
+        items = data["data"] if "data" in data else data.get("recommendations", [])
         if isinstance(items, list):
             assert len(items) <= 10, (
                 f"Response returned {len(items)} items, expected <= 10"
@@ -287,10 +287,14 @@ class TestRecommendationsAPI:
             "Response should contain 'data' or 'recommendations' field"
         )
         
-        # Verify data field is a list
-        items = data.get("data") or data.get("recommendations")
+        # Verify data field is a list (use 'in' check to handle empty lists correctly)
+        if "data" in data:
+            items = data["data"]
+        else:
+            items = data.get("recommendations")
+        
         assert isinstance(items, list), (
-            "Data field should be a list"
+            f"Data field should be a list, got {type(items).__name__}: {items}"
         )
         
         # Verify pagination metadata exists
