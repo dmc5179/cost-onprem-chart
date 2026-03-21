@@ -5,9 +5,10 @@ __pycache__/
 
 # Virtual environments
 venv/
+.venv/
 env/
 ENV/
-.venv/
+.venv-*/
 cost-mgmt-venv/
 *-venv/
 
@@ -36,3 +37,5 @@ ci-artifacts-*/
 version_info.json
 .digest-cache/*.digest
 reports/junit.xml
+**/*.json.gz
+debug-exports/**/*
