@@ -180,7 +180,7 @@ log_step() {
 
 log_verbose() {
     if [[ "${VERBOSE}" == "true" ]]; then
-        echo -e "${CYAN}[VERBOSE]${NC} $*"
+        echo -e "${CYAN}[VERBOSE]${NC} $*" >&2
     fi
 }
 
@@ -596,9 +596,8 @@ run_tests() {
         if validate_cpu_limit "${LISTENER_CPU_LIMIT}"; then
             local effective_cpu_limit="${LISTENER_CPU_LIMIT}"
             if [[ "${LISTENER_CPU_LIMIT}" == "max" ]]; then
-                local max_cpu
-                max_cpu=$(calculate_max_listener_cpu)
-                effective_cpu_limit="${max_cpu}m"
+                calculate_max_listener_cpu
+                effective_cpu_limit="${MAX_LISTENER_CPU}m"
                 log_info "Calculated maximum available CPU: ${effective_cpu_limit}"
             fi
             
@@ -734,8 +733,10 @@ parse_cpu_to_millicores() {
     fi
 }
 
-# Calculate maximum available CPU on the node where listener runs
+# Calculate maximum available CPU on the node where listener runs.
+# Sets MAX_LISTENER_CPU (millicores, no "m" suffix) as a global variable.
 calculate_max_listener_cpu() {
+    MAX_LISTENER_CPU=""
     local release="${HELM_RELEASE_NAME:-cost-onprem}"
     local listener_deploy="${release}-koku-listener"
     
@@ -746,7 +747,7 @@ calculate_max_listener_cpu() {
     
     if [[ -z "${listener_node}" ]]; then
         log_warning "Could not determine listener node, using default max of 2000m"
-        echo "2000"
+        MAX_LISTENER_CPU="2000"
         return
     fi
     
@@ -786,7 +787,7 @@ calculate_max_listener_cpu() {
     fi
     
     log_verbose "Node ${listener_node}: allocatable=${allocatable_millicores}m, used=${used_requests}m, listener=${listener_request_millicores}m, available=${available}m"
-    echo "${available}"
+    MAX_LISTENER_CPU="${available}"
 }
 
 # Validate CPU limit format and value
