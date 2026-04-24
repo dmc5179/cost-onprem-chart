@@ -10,17 +10,10 @@ Koku Service Names
 */}}
 
 {{/*
-Koku API reads deployment name
+Koku API deployment name (unified - handles both reads and writes)
 */}}
-{{- define "cost-onprem.koku.api.reads.name" -}}
-{{- printf "%s-koku-api-reads" (include "cost-onprem.fullname" .) -}}
-{{- end -}}
-
-{{/*
-Koku API writes deployment name
-*/}}
-{{- define "cost-onprem.koku.api.writes.name" -}}
-{{- printf "%s-koku-api-writes" (include "cost-onprem.fullname" .) -}}
+{{- define "cost-onprem.koku.api.name" -}}
+{{- printf "%s-koku-api" (include "cost-onprem.fullname" .) -}}
 {{- end -}}
 
 {{/*
@@ -126,7 +119,11 @@ Valkey Connection Helpers (cache/broker)
 Valkey host
 */}}
 {{- define "cost-onprem.koku.valkey.host" -}}
+{{- if .Values.valkey.deploy -}}
 {{- printf "%s-valkey" (include "cost-onprem.fullname" .) -}}
+{{- else -}}
+{{- .Values.valkey.host -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -145,18 +142,18 @@ Kafka Connection Helpers (uses shared Kafka from infrastructure)
 {{/*
 Kafka hostname (without port)
 INSIGHTS_KAFKA_HOST - Koku's EnvConfigurator concatenates this with port
-Uses configurable value from .Values.costManagement.kafka.host
+Delegates to the shared kafka.host helper which parses kafka.bootstrapServers
 */}}
 {{- define "cost-onprem.koku.kafka.host" -}}
-{{- .Values.costManagement.kafka.host | default "kafka" -}}
+{{- include "cost-onprem.kafka.host" . -}}
 {{- end -}}
 
 {{/*
 Kafka port
-Uses configurable value from .Values.costManagement.kafka.port
+Delegates to the shared kafka.port helper which parses kafka.bootstrapServers
 */}}
 {{- define "cost-onprem.koku.kafka.port" -}}
-{{- .Values.costManagement.kafka.port | default "9092" -}}
+{{- include "cost-onprem.kafka.port" . -}}
 {{- end -}}
 
 {{/*
@@ -195,21 +192,11 @@ Note: We don't add component here - each resource defines its own specific compo
 {{- end -}}
 
 {{/*
-Selector labels for Koku API reads
+Selector labels for Koku API (unified)
 */}}
-{{- define "cost-onprem.koku.api.reads.selectorLabels" -}}
+{{- define "cost-onprem.koku.api.selectorLabels" -}}
 {{ include "cost-onprem.selectorLabels" . }}
-app.kubernetes.io/component: cost-management-api-reads
-cost-onprem.io/api-type: reads
-{{- end -}}
-
-{{/*
-Selector labels for Koku API writes
-*/}}
-{{- define "cost-onprem.koku.api.writes.selectorLabels" -}}
-{{ include "cost-onprem.selectorLabels" . }}
-app.kubernetes.io/component: cost-management-api-writes
-cost-onprem.io/api-type: writes
+app.kubernetes.io/component: cost-management-api
 {{- end -}}
 
 {{/*
@@ -321,6 +308,16 @@ Common environment variables for Koku API and Celery
   value: {{ include "cost-onprem.koku.valkey.host" . | quote }}
 - name: REDIS_PORT
   value: {{ include "cost-onprem.koku.valkey.port" . | quote }}
+{{- if .Values.valkey.auth.enabled }}
+{{- if not .Values.valkey.auth.secretName }}
+  {{- fail "valkey.auth.enabled is true but valkey.auth.secretName is empty. Provide the name of a Secret containing key 'redis-password'." -}}
+{{- end }}
+- name: REDIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.valkey.auth.secretName }}
+      key: redis-password
+{{- end }}
 - name: CELERY_RESULT_EXPIRES
   value: {{ .Values.costManagement.celery.resultExpires | default "28800" | quote }}
 - name: INSIGHTS_KAFKA_HOST
@@ -348,9 +345,9 @@ Common environment variables for Koku API and Celery
       name: {{ include "cost-onprem.storage.secretName" . }}
       key: secret-key
 # S3 Region for signature generation (required for S3v4 signatures)
-# NooBaa/MinIO don't use regions, but boto3 requires it for signature calculation
+# Most on-premise S3 backends don't use regions, but boto3 requires it for signature calculation
 - name: S3_REGION
-  value: {{ .Values.odf.s3.region | default "onprem" | quote }}
+  value: {{ include "cost-onprem.storage.s3Region" . | quote }}
 # AWS SDK configuration for S3v4 signatures
 - name: AWS_CONFIG_FILE
   value: /etc/aws/config

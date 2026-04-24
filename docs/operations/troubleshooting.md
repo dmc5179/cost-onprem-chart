@@ -320,20 +320,20 @@ oc exec -n cost-onprem deployment/cost-onprem-gateway -- \
 
 ---
 
-**Strimzi operator OOMKilled:**
+**AMQ Streams operator OOMKilled:**
 
 When this happens you typically see the operator pod cycling with logs full of repeated `Attempting reconnect` messages, `SessionExpiredException`, or `NoSuchElementException` just before it is killed by the OOM killer.
 ```bash
 # Check pod status for OOMKilled
-kubectl get pods -n kafka -l name=strimzi-cluster-operator
+kubectl get pods -n kafka -l strimzi.io/kind=cluster-operator
 
-# Bump the operator memory limits on the fly
-kubectl set resources deployment/strimzi-cluster-operator \
-  -n kafka --containers=strimzi-cluster-operator \
-  --limits=memory=768Mi --requests=memory=768Mi
+# Bump the operator memory limits on the fly (find the deployment name first)
+kubectl get deployment -n kafka -l strimzi.io/kind=cluster-operator
+kubectl set resources deployment/<operator-deployment-name> \
+  -n kafka --limits=memory=768Mi --requests=memory=768Mi
 
 # Confirm the pod restarts with the new limits
-kubectl get pods -n kafka -l name=strimzi-cluster-operator
+kubectl get pods -n kafka -l strimzi.io/kind=cluster-operator
 ```
 
 ---
@@ -357,9 +357,9 @@ kubectl exec -n cost-onprem $VALKEY_POD -- valkey-cli FLUSHALL
 kubectl delete pod -n cost-onprem -l app.kubernetes.io/component=listener
 kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=listener -n cost-onprem --timeout=60s
 
-# 3. Delete test data from S3
-kubectl exec -n cost-onprem -l app.kubernetes.io/name=minio -- \
-    mc rm --recursive --force myminio/koku-bucket/reports/
+# 3. Delete test data from S3 (using mc client pod)
+kubectl run mc-cleanup --rm -it --restart=Never --image=minio/mc:latest -- \
+    sh -c 'mc alias set s3 http://s4.cost-onprem.svc.cluster.local:7480 $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY && mc rm --recursive --force s3/koku-bucket/reports/'
 
 # 4. Run E2E test
 NAMESPACE=cost-onprem ./scripts/run-pytest.sh --e2e

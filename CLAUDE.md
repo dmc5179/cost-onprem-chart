@@ -51,9 +51,9 @@ CI Step Registry: insights-onprem/cost-onprem-chart/e2e/
 
 **CI Execution Sequence:**
 1. Dependencies: Installs yq, kubectl, helm, oc
-2. MinIO Setup: Reads config from `insights-onprem-minio-deploy` step
-3. Cost Management Operator: Installs via OLM (stable channel)
-4. Helm Wrapper: Injects MinIO storage config for cost-onprem chart
+2. S4 Setup: Reads config from `insights-onprem-s4-deploy` step
+3. Cost Management Metrics Operator: Installs via OLM (stable channel)
+4. Helm Wrapper: Injects S4 storage config for cost-onprem chart
 5. Deploy & Test: Runs `scripts/deploy-test-cost-onprem.sh --namespace cost-onprem --verbose`
 
 **Default CI Test Run:**
@@ -70,11 +70,11 @@ pytest -m "not extended" --junit-xml=reports/junit.xml
 ### Running Tests Locally
 
 ```bash
-# CI mode (default) - excludes extended tests
-NAMESPACE=cost-onprem-ocp ./scripts/run-pytest.sh
+# Run all tests (including UI)
+NAMESPACE=cost-onprem ./scripts/run-pytest.sh
 
-# Extended tests (requires ODF/S3)
-NAMESPACE=cost-onprem-ocp ./scripts/run-pytest.sh --extended
+# Run all tests except UI
+NAMESPACE=cost-onprem ./scripts/run-pytest.sh --no-ui
 
 # Specific suites
 ./scripts/run-pytest.sh --helm
@@ -82,6 +82,7 @@ NAMESPACE=cost-onprem-ocp ./scripts/run-pytest.sh --extended
 ./scripts/run-pytest.sh --e2e
 ./scripts/run-pytest.sh --infrastructure
 ./scripts/run-pytest.sh --ros
+./scripts/run-pytest.sh --ui
 ```
 
 ### Test Markers
@@ -267,11 +268,22 @@ kubectl logs -n cost-onprem -l app.kubernetes.io/component=ros-optimization --ta
 
 ### Deploy Chart
 ```bash
-# Full deployment + tests
+# Full deployment + chart tests
 ./scripts/deploy-test-cost-onprem.sh --namespace cost-onprem --verbose
 
-# Tests only (existing deployment)
-./scripts/deploy-test-cost-onprem.sh --tests-only
+# Deploy only — skip chart tests
+./scripts/deploy-test-cost-onprem.sh --skip-chart-tests
+
+# Chart tests only (skip deployment)
+./scripts/deploy-test-cost-onprem.sh --skip-deploy
+
+# Dry run to preview what would execute
+./scripts/deploy-test-cost-onprem.sh --dry-run --verbose
+```
+
+After modifying flag parsing in `deploy-test-cost-onprem.sh`, validate all permutations:
+```bash
+./scripts/qe/test-gh-workflow-locally.sh .github/workflows/validate-deploy-test-script.yml
 ```
 
 ### Troubleshoot
@@ -296,3 +308,59 @@ kubectl logs -n cost-onprem -l app.kubernetes.io/component=ros-processor | grep 
 ```
 
 **Note:** Downloaded artifacts are saved to `ci-artifacts-pr<PR>-<BUILD_ID>/` and should NOT be deleted unless explicitly requested by the user.
+
+---
+
+## IQE Integration Testing
+
+IQE (Insights QE) tests provide comprehensive integration testing for cost-management functionality.
+
+### Prerequisites
+
+1. **Red Hat Network**: Must be on VPN for repository access
+2. **Quay.io Access**: For containerized tests, need access to `quay.io/cloudservices/iqe-tests`
+   - Requires user file in `app-interface` repo: `data/teams/insights/users/<username>.yml`
+3. **Local Repositories**: For local tests, clone adjacent to this repo:
+   ```
+   ../iqe-core/
+   ../iqe-cost-management-plugin/
+   ```
+
+### Running IQE Tests
+
+```bash
+# IQE only — skip deploy + chart tests, boost listener CPU (recommended)
+./scripts/deploy-test-cost-onprem.sh --iqe-only \
+    --listener-cpu max --iqe-profile smoke
+
+# Containerized standalone (no CPU boost)
+./scripts/run-iqe-tests.sh --profile smoke
+
+# Local (requires VPN + local repos)
+./scripts/run-iqe-tests-local.sh --setup              # First time
+./scripts/run-iqe-tests-local.sh --profile smoke       # Run tests
+```
+
+### Test Profiles
+
+| Profile | Tests | Duration | Use Case |
+|---------|-------|----------|----------|
+| `smoke` | ~43 | ~17 min | PR checks |
+| `extended` | ~2100 | ~33 min | Daily CI |
+| `stable` | ~2350 | ~40 min | Weekly CI |
+| `full` | ~3324 | ~60 min | Release validation |
+
+Tests are I/O-bound waiting for backend data processing. Use `--listener-cpu max`
+to boost the listener deployment's CPU during the run (~40-50% faster ingestion).
+
+### Known Issues
+
+Tests are organized into skip groups with `SKIP_*` env vars. Key blockers:
+- **COST-7179** — GPU/MIG schema mismatch blocks ~90 tests + cascading failures
+- **90-day data** — NISE generates ~60 days; 90-day range tests fail (~228 tests)
+- **FLPATH-3423** — Source CRUD update returns 500 (1 test)
+
+See `docs/development/skipped-iqe-tests.md` for full details on all skip groups,
+pytest markers, and test profiles.
+
+See `docs/development/iqe-testing-setup.md` for full setup guide.

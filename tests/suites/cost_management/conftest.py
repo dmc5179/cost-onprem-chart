@@ -27,8 +27,9 @@ from e2e_helpers import (
     ensure_nise_available,
     generate_cluster_id,
     generate_nise_data,
-    get_koku_api_reads_url,
-    get_koku_api_writes_url,
+    get_koku_api_url,
+    get_nise_template_path,
+    list_nise_templates,
     register_source,
     upload_with_retry,
     wait_for_provider,
@@ -47,8 +48,7 @@ def cleanup_old_cost_val_clusters(
     namespace: str,
     db_pod: str,
     ingress_pod: str,
-    api_reads_url: str,
-    api_writes_url: str,
+    api_url: str,
     rh_identity_header: str,
 ):
     """Clean up any leftover cost-val clusters from previous test runs.
@@ -64,7 +64,7 @@ def cleanup_old_cost_val_clusters(
             namespace,
             ingress_pod,
             [
-                "curl", "-s", f"{api_reads_url}/sources",
+                "curl", "-s", f"{api_url}/sources",
                 "-H", "Content-Type: application/json",
                 "-H", f"X-Rh-Identity: {rh_identity_header}",
             ],
@@ -83,7 +83,7 @@ def cleanup_old_cost_val_clusters(
                         ingress_pod,
                         [
                             "curl", "-s", "-X", "DELETE",
-                            f"{api_writes_url}/sources/{source_id}",
+                            f"{api_url}/sources/{source_id}",
                             "-H", f"X-Rh-Identity: {rh_identity_header}",
                         ],
                         container="ingress",
@@ -158,15 +158,9 @@ def cleanup_old_cost_val_clusters(
 
 
 @pytest.fixture(scope="module")
-def koku_api_reads_url_cost_mgmt(cluster_config) -> str:
-    """Get Koku API reads URL for cost management tests."""
-    return get_koku_api_reads_url(cluster_config.helm_release_name, cluster_config.namespace)
-
-
-@pytest.fixture(scope="module")
-def koku_api_writes_url_cost_mgmt(cluster_config) -> str:
-    """Get Koku API writes URL for cost management tests."""
-    return get_koku_api_writes_url(cluster_config.helm_release_name, cluster_config.namespace)
+def koku_api_url(cluster_config) -> str:
+    """Get Koku API URL for cost management tests (unified deployment)."""
+    return get_koku_api_url(cluster_config.helm_release_name, cluster_config.namespace)
 
 
 # =============================================================================
@@ -192,10 +186,17 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
     Environment Variables:
     - E2E_CLEANUP_BEFORE: Run cleanup before tests (default: true)
     - E2E_CLEANUP_AFTER: Run cleanup after tests (default: true)
+    - NISE_IQE_TEMPLATE: Use a NISE template instead of default config.
+                         Example: "ocp_report_ros_0.yml" for ROS optimization testing
+                         Available templates in tests/data/nise_templates/:
+                         - ocp_report_ros_0.yml: ROS optimization testing
+                         - ocp_report_advanced.yml: Complex multi-node setup
+                         See: tests/data/nise_templates/README.md
     """
     # Check cleanup settings
     cleanup_before = os.environ.get("E2E_CLEANUP_BEFORE", "true").lower() == "true"
     cleanup_after = os.environ.get("E2E_CLEANUP_AFTER", "true").lower() == "true"
+    iqe_template = os.environ.get("NISE_IQE_TEMPLATE", "")
     
     # Check NISE availability
     if not ensure_nise_available():
@@ -216,9 +217,8 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
     temp_dir = tempfile.mkdtemp(prefix="cost_validation_")
     source_registration = None
     
-    # Use Koku API URLs (sources are now part of Koku)
-    api_reads_url = get_koku_api_reads_url(cluster_config.helm_release_name, cluster_config.namespace)
-    api_writes_url = get_koku_api_writes_url(cluster_config.helm_release_name, cluster_config.namespace)
+    # Use Koku API URL (sources are now part of Koku, unified deployment)
+    api_url = get_koku_api_url(cluster_config.helm_release_name, cluster_config.namespace)
     rh_identity = create_rh_identity_header(org_id)
     
     # Use centralized NISE config
@@ -231,14 +231,16 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
         print(f"  Cluster ID: {cluster_id}")
         print(f"  Cleanup before: {cleanup_before}")
         print(f"  Cleanup after: {cleanup_after}")
+        if iqe_template:
+            print(f"  IQE Template: {iqe_template}")
         
         # Pre-test cleanup: Remove any leftover cost-val clusters from previous runs
         if cleanup_before:
             print("\n  [0/5] Pre-test cleanup...")
             cleanup_old_cost_val_clusters(
-            cluster_config.namespace, db_pod, ingress_pod,
-            api_reads_url, api_writes_url, rh_identity
-        )
+                cluster_config.namespace, db_pod, ingress_pod,
+                api_url, rh_identity,
+            )
             print("       Cleanup complete")
         else:
             print("\n  [0/5] Pre-test cleanup SKIPPED (E2E_CLEANUP_BEFORE=false)")
@@ -252,7 +254,11 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
         start_date = (now - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
         end_date = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         
-        files = generate_nise_data(cluster_id, start_date, end_date, temp_dir, config=nise_config)
+        files = generate_nise_data(
+            cluster_id, start_date, end_date, temp_dir,
+            config=nise_config,
+            iqe_template=iqe_template if iqe_template else None,
+        )
         print(f"       Generated {len(files['all_files'])} CSV files")
         
         if not files["all_files"]:
@@ -263,8 +269,7 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
         source_registration = register_source(
             namespace=cluster_config.namespace,
             pod=ingress_pod,
-            api_reads_url=api_reads_url,
-            api_writes_url=api_writes_url,
+            api_url=api_url,
             rh_identity_header=rh_identity,
             cluster_id=cluster_id,
             org_id=org_id,
@@ -366,9 +371,9 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
                 if delete_source(
                     cluster_config.namespace,
                     ingress_pod,
-                    api_writes_url,
+                    api_url,
                     rh_identity,
-                source_registration.source_id,
+                    source_registration.source_id,
                     container="ingress",
                 ):
                     print(f"  Deleted source {source_registration.source_id}")

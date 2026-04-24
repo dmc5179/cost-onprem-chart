@@ -4,7 +4,7 @@
 # This chart deploys the complete Cost Management on-premise solution:
 # - ROS (Resource Optimization Service)
 # - Cost Management Service (Koku and Sources API)
-# - Shared infrastructure (PostgreSQL, Kafka, Valkey, MinIO/ODF)
+# - Shared infrastructure (PostgreSQL, Kafka, Valkey, S3 object storage)
 #
 # Naming conventions:
 # - Use camelCase for all variable names
@@ -23,8 +23,14 @@ global:
   pullPolicy: IfNotPresent
   imagePullSecrets: []
 
-  # Storage class for persistent volumes (auto-detected if empty)
-  storageClass: ""
+  # Cluster domain for Route hostnames (detected by install script; default allows offline templating)
+  clusterDomain: "apps.cluster.local"
+
+  # Storage class for PVCs (detected by install script; default allows offline templating)
+  storageClass: "ocs-storagecluster-ceph-rbd"
+
+  # Volume mode for PVCs (Filesystem or Block)
+  volumeMode: "Filesystem"
 
   # Init container images (shared across all services)
   # Using alternative registries to avoid docker.io rate limits
@@ -41,8 +47,8 @@ ros:
   # All ROS services (api, processor, recommendationPoller, housekeeper, partitionCleaner)
   # use the same image
   image:
-    repository: quay.io/insights-onprem/ros-ocp-backend
-    tag: "latest"
+    repository: quay.io/redhat-services-prod/insights-management-tenant/insights-ocp-resource-optimization/ros-ocp-backend
+    tag: "45e36af"
     pullPolicy: Always
 
   # Service Account
@@ -140,108 +146,61 @@ costManagement:
     enabled: true
 
     image:
-      repository: quay.io/insights-onprem/koku
-      tag: "sources"
+      repository: quay.io/redhat-services-prod/cost-mgmt-dev-tenant/koku
+      tag: "72bbc6a"
       pullPolicy: Always
 
-    reads:
-      replicas: 1
-      resources:
-        requests:
-          cpu: 250m
-          memory: 1Gi
-        limits:
-          cpu: 1
-          memory: 2Gi
+    replicas: 1
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: 1
+        memory: 2Gi
 
-      livenessProbe:
-        httpGet:
-          path: /livez
-          port: 9000
-          scheme: HTTP
-        initialDelaySeconds: 30
-        periodSeconds: 20
-        timeoutSeconds: 3
-        failureThreshold: 5
-        successThreshold: 1
+    livenessProbe:
+      httpGet:
+        path: /livez
+        port: 9000
+        scheme: HTTP
+      initialDelaySeconds: 30
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 5
+      successThreshold: 1
 
-      readinessProbe:
-        httpGet:
-          path: /readyz
-          port: 9000
-          scheme: HTTP
-        initialDelaySeconds: 30
-        periodSeconds: 20
-        timeoutSeconds: 3
-        failureThreshold: 5
-        successThreshold: 1
+    readinessProbe:
+      httpGet:
+        path: /readyz
+        port: 9000
+        scheme: HTTP
+      initialDelaySeconds: 30
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 5
+      successThreshold: 1
 
-      env:
-        API_PATH_PREFIX: /api/cost-management
-        DEVELOPMENT: "False"
-        GUNICORN_LOG_LEVEL: INFO
-        KOKU_LOG_LEVEL: INFO
-        DJANGO_LOG_LEVEL: INFO
-        DJANGO_LOG_FORMATTER: simple
-        DJANGO_LOG_HANDLERS: console
-        PROMETHEUS_MULTIPROC_DIR: /tmp
-        KOKU_ENABLE_SENTRY: "False"
-        CACHED_VIEWS_DISABLED: "False"
-        RETAIN_NUM_MONTHS: "3"
-        NOTIFICATION_CHECK_TIME: "24"
-        ENHANCED_ORG_ADMIN: "True"
-        RBAC_CACHE_TIMEOUT: "300"
-        CACHE_TIMEOUT: "3600"
-        TAG_ENABLED_LIMIT: "200"
-        USE_READREPLICA: "False"
-        GUNICORN_WORKERS: "2"
-        GUNICORN_THREADS: "4"
-
-    writes:
-      replicas: 1
-      resources:
-        requests:
-          cpu: 250m
-          memory: 1Gi
-        limits:
-          cpu: 1
-          memory: 2Gi
-
-      livenessProbe:
-        httpGet:
-          path: /livez
-          port: 9000
-          scheme: HTTP
-        initialDelaySeconds: 30
-        periodSeconds: 20
-        timeoutSeconds: 3
-        failureThreshold: 5
-        successThreshold: 1
-
-      readinessProbe:
-        httpGet:
-          path: /readyz
-          port: 9000
-          scheme: HTTP
-        initialDelaySeconds: 30
-        periodSeconds: 20
-        timeoutSeconds: 3
-        failureThreshold: 5
-        successThreshold: 1
-
-      env:
-        API_PATH_PREFIX: /api/cost-management
-        DEVELOPMENT: "False"
-        ENHANCED_ORG_ADMIN: "True"
-        GUNICORN_LOG_LEVEL: INFO
-        KOKU_LOG_LEVEL: INFO
-        DJANGO_LOG_LEVEL: INFO
-        DJANGO_LOG_FORMATTER: simple
-        DJANGO_LOG_HANDLERS: console
-        PROMETHEUS_MULTIPROC_DIR: /tmp
-        KOKU_ENABLE_SENTRY: "False"
-        GUNICORN_WORKERS: "1"
-        GUNICORN_THREADS: "4"
+    env:
+      API_PATH_PREFIX: /api/cost-management
+      DEVELOPMENT: "False"
+      GUNICORN_LOG_LEVEL: INFO
+      KOKU_LOG_LEVEL: INFO
+      DJANGO_LOG_LEVEL: INFO
+      DJANGO_LOG_FORMATTER: simple
+      DJANGO_LOG_HANDLERS: console
+      PROMETHEUS_MULTIPROC_DIR: /tmp
+      KOKU_ENABLE_SENTRY: "False"
+      CACHED_VIEWS_DISABLED: "False"
+      RETAIN_NUM_MONTHS: "3"
+      NOTIFICATION_CHECK_TIME: "24"
+      ENHANCED_ORG_ADMIN: "True"
+      RBAC_CACHE_TIMEOUT: "300"
+      CACHE_TIMEOUT: "3600"
+      TAG_ENABLED_LIMIT: "200"
+      USE_READREPLICA: "False"
+      GUNICORN_WORKERS: "2"
+      GUNICORN_THREADS: "4"
 
     service:
       type: ClusterIP
@@ -266,6 +225,16 @@ costManagement:
       DJANGO_LOG_LEVEL: INFO
       GUNICORN_LOG_LEVEL: INFO
       PROMETHEUS_MULTIPROC_DIR: /tmp
+      # Data retention: how many months of cost data to keep in the database.
+      # The MASU vacuum process purges data older than this threshold.
+      # Must match the value set in costManagement.api.env for consistency.
+      RETAIN_NUM_MONTHS: "3"
+      # Initial ingest: how many months of historical data to process when
+      # a new cost data source (provider) is first registered.
+      INITIAL_INGEST_NUM_MONTHS: "2"
+      # Override: when True, forces INITIAL_INGEST_NUM_MONTHS for all providers,
+      # even those already fully set up. Default is False (normal rolling ingest).
+      INITIAL_INGEST_OVERRIDE: "False"
 
   # ---------------------------------------------------------------------------
   # Kafka Listener
@@ -401,110 +370,6 @@ costManagement:
             cpu: 400m
             memory: 1Gi
 
-      priorityXl:
-        # On-prem: 1 replica to fit cluster constraints (SaaS uses 2)
-        replicas: 1
-        queue: priority,priority_xl
-        concurrency: 5
-        resources:
-          # Aligned with SaaS Clowder configuration
-          requests:
-            cpu: 150m
-            memory: 400Mi
-          limits:
-            cpu: 300m
-            memory: 750Mi
-
-      refreshXl:
-        # OCP-ONLY: Disabled - not needed for OCP
-        replicas: 0
-        queue: refresh,refresh_xl
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            cpu: 200m
-            memory: 512Mi
-
-      summaryXl:
-        replicas: 1
-        queue: summary,summary_xl
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 100m
-            memory: 200Mi
-          limits:
-            cpu: 200m
-            memory: 400Mi
-
-      downloadXl:
-        # OCP-ONLY: Disabled - not needed for OCP
-        replicas: 0
-        queue: download,download_xl
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 200m
-            memory: 512Mi
-          limits:
-            cpu: 400m
-            memory: 1Gi
-
-      priorityPenalty:
-        # On-prem: 1 replica to fit cluster constraints (SaaS uses 2)
-        replicas: 1
-        queue: priority,priority_penalty
-        concurrency: 5
-        resources:
-          # Aligned with SaaS Clowder configuration
-          requests:
-            cpu: 150m
-            memory: 400Mi
-          limits:
-            cpu: 300m
-            memory: 750Mi
-
-      refreshPenalty:
-        # OCP-ONLY: Disabled - not needed for OCP
-        replicas: 0
-        queue: refresh,refresh_penalty
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            cpu: 200m
-            memory: 512Mi
-
-      summaryPenalty:
-        replicas: 1
-        queue: summary,summary_penalty
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 100m
-            memory: 200Mi
-          limits:
-            cpu: 200m
-            memory: 400Mi
-
-      downloadPenalty:
-        # OCP-ONLY: Disabled - not needed for OCP
-        replicas: 0
-        queue: download,download_penalty
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 200m
-            memory: 512Mi
-          limits:
-            cpu: 400m
-            memory: 1Gi
-
       ocp:
         replicas: 1
         queue: ocp
@@ -517,57 +382,9 @@ costManagement:
             cpu: 500m
             memory: 1Gi
 
-      ocpXl:
-        replicas: 1
-        queue: ocp_xl
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            cpu: 200m
-            memory: 512Mi
-
-      ocpPenalty:
-        replicas: 1
-        queue: ocp_penalty
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            cpu: 200m
-            memory: 512Mi
-
       costModel:
         replicas: 1
         queue: cost_model
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            cpu: 200m
-            memory: 512Mi
-
-      costModelXl:
-        replicas: 1
-        queue: cost_model_xl
-        concurrency: 5
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            cpu: 200m
-            memory: 512Mi
-
-      costModelPenalty:
-        replicas: 1
-        queue: cost_model_penalty
         concurrency: 5
         resources:
           requests:
@@ -624,7 +441,7 @@ costManagement:
 kruize:
   image:
     repository: quay.io/redhat-services-prod/kruize-autotune-tenant/autotune
-    tag: "d0b4337"
+    tag: "5eeae99"
 
   port: 8080
 
@@ -698,7 +515,7 @@ ingress:
     # This is REQUIRED by insights-ingress-go
     validTypes: "hccm"
 
-  # Storage backend configuration (MinIO/S3)
+  # Storage backend configuration (S3-compatible)
   # INGRESS_STAGEBUCKET - staging bucket where uploads are stored before processing
   storage:
     bucket: "insights-upload-perma"
@@ -762,6 +579,15 @@ ingress:
 # - Credentials injected via secretKeyRef (never exposed in pod specs)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 database:
+  # Set to false to skip deploying the bundled PostgreSQL StatefulSet and Service.
+  # When false, you must:
+  #   1. Set database.server.host to your external database hostname
+  #   2. Pre-create the required databases: costonprem_ros, costonprem_kruize, costonprem_koku
+  #   3. Pre-create the required users with appropriate grants
+  #   4. Create a credentials secret (or set database.secretName)
+  # See docs/operations/configuration.md "External Infrastructure" for full setup guide.
+  deploy: true
+
   # Unified Database Server Configuration
   server:
     image:
@@ -781,14 +607,14 @@ database:
   # Database Credentials Secret Name
   # Created by: scripts/install-helm-chart.sh
   # Override to use a different secret name (must exist before Helm install)
-  existingSecret: ""  # Empty = use default: <release-name>-db-credentials
+  secretName: ""  # Empty = use default: <release-name>-db-credentials
 
   # ROS Database Configuration
   ros:
     # Database name on the unified server
     # Standardized naming: costonprem_<service> (underscores for PostgreSQL compatibility)
     name: costonprem_ros
-    # Dedicated user for ROS service (only used if existingSecret is empty)
+    # Dedicated user for ROS service (only used if secretName is empty)
     user: ros_user
     password: ros_password
 
@@ -797,7 +623,7 @@ database:
     # Database name on the unified server
     # Standardized naming: costonprem_<service> (underscores for PostgreSQL compatibility)
     name: costonprem_kruize
-    # Dedicated user for Kruize service (only used if existingSecret is empty)
+    # Dedicated user for Kruize service (only used if secretName is empty)
     user: kruize_user
     password: kruize_password
 
@@ -806,45 +632,63 @@ database:
     # Database name on the unified server
     # Standardized naming: costonprem_<service> (underscores for PostgreSQL compatibility)
     name: costonprem_koku
-    # Dedicated user for Koku service (only used if existingSecret is empty)
+    # Dedicated user for Koku service (only used if secretName is empty)
     user: koku_user
     password: koku_password
 
 # -----------------------------------------------------------------------------
 # Shared Infrastructure - Kafka
 # -----------------------------------------------------------------------------
-# IMPORTANT: Kafka/Strimzi deployment is NOT managed by this Helm chart!
-# The install-helm-chart.sh script installs Strimzi operator and creates Kafka cluster separately
-# This section only contains connection settings
+# IMPORTANT: Kafka deployment is NOT managed by this Helm chart!
+# The deploy-kafka.sh script installs AMQ Streams operator and creates a KRaft Kafka cluster separately.
+# This section only contains connection settings.
 kafka:
   # Bootstrap servers for Kafka cluster
   # This is auto-configured by the install script based on the Kafka cluster it creates
   bootstrapServers: "cost-onprem-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092"
 
-  # Security protocol (PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL)
+  # Security protocol — only PLAINTEXT is currently supported.
+  # SASL/TLS support requires upstream application changes (see docs/operations/configuration.md).
   securityProtocol: "PLAINTEXT"
 
 # -----------------------------------------------------------------------------
 # Shared Infrastructure - Cache (Valkey)
 # -----------------------------------------------------------------------------
 # Valkey is used as Celery broker/backend and for caching
+# Set deploy to false to use an external Redis/Valkey instance instead.
 valkey:
+  # Set to false to skip deploying the bundled Valkey Deployment, Service, and PVC.
+  # When false, you must:
+  #   1. Set valkey.host to your external Redis/Valkey hostname
+  #   2. Set valkey.port if not using the default 6379
+  #   3. Optionally configure valkey.auth for password-protected instances
+  # See docs/operations/configuration.md "External Infrastructure" for full setup guide.
+  deploy: true
   image:
     repository: registry.redhat.io/rhel10/valkey-8
     tag: "latest"
     pullPolicy: IfNotPresent
 
   # Connection settings
-  host: "valkey"
+  # When deploy is true, host is ignored (chart uses {release}-valkey internally).
+  # When deploy is false, set host to your external Redis/Valkey endpoint.
+  host: ""
   port: 6379
   bindAddress: "0.0.0.0"
   maxMemory: "512mb"
   maxMemoryPolicy: "allkeys-lru"
 
+  # Authentication for external Redis/Valkey (only used when deploy is false)
+  # For password-protected Redis instances (e.g., ElastiCache, Redis Enterprise)
+  auth:
+    enabled: false
+    # Name of the Secret containing key: 'redis-password'
+    # Required when auth.enabled is true.
+    secretName: ""
+
   # Persistence configuration for Celery chord callback reliability
-  # IMPORTANT: Enable this for production to prevent data loss on pod restarts
+  # Persistent storage is always enabled when deploying bundled Valkey.
   persistence:
-    enabled: true
     size: 5Gi
     storageClassName: ""  # Use default storage class
 
@@ -865,22 +709,47 @@ valkey:
     # fsGroup: 1000740000  # Example: CI environment value
 
 # -----------------------------------------------------------------------------
-# Shared Infrastructure - Object Storage (ODF)
+# Shared Infrastructure - S3-Compatible Object Storage
 # -----------------------------------------------------------------------------
-# This chart uses OpenShift Data Foundation (ODF) for object storage.
-# ODF provides S3-compatible storage via NooBaa.
-odf:
-  # ODF endpoint - auto-detected from NooBaa CRD if not specified
-  # endpoint: "s3.openshift-storage.svc.cluster.local"
-  # port: 443
-  # useSSL: true
+# This chart requires S3-compatible object storage. Supported backends:
+#   - ODF (OpenShift Data Foundation) with NooBaa or Direct Ceph RGW
+#   - S4 / Ceph RGW (for development/testing)
+#   - AWS S3 (for disconnected AWS deployments)
+#   - Any S3-compatible storage provider
+#
+# Configuration options:
+#   1. Manual: Set endpoint/port/useSSL/secretName below and pre-create
+#      the credentials secret yourself. The install script will skip S3 setup.
+#   2. Automated: Use install-helm-chart.sh which auto-detects ODF/S4/OBC
+#      and overrides the default endpoint via --set.
+#
+objectStorage:
+  # S3 endpoint hostname (without protocol or port)
+  # Examples:
+  #   - ODF NooBaa:    "s3.openshift-storage.svc.cluster.local"
+  #   - Direct Ceph:   "rook-ceph-rgw-ocs-storagecluster-cephobjectstore.openshift-storage.svc"
+  #   - S4 (dev/test): "s4.s4-test.svc.cluster.local"
+  #   - AWS S3:        "s3.amazonaws.com"
+  # When empty, the install script auto-detects. Default allows offline templating (oc-mirror, helm template).
+  endpoint: "s3.openshift-storage.svc.cluster.local"
 
-  # rootUser and rootPassword removed - stored in cost-onprem-storage-credentials secret
-  # Created by: scripts/install-helm-chart.sh
-  # Credentials: minioadmin / <random-32-char>
+  # S3 port (443 for HTTPS, 80 for HTTP)
+  port: 443
+
+  # Whether to use SSL/TLS for S3 connections
+  useSSL: true
+
+  # Name of a pre-existing Kubernetes Secret containing S3 credentials.
+  # The secret must have keys: 'access-key' and 'secret-key'.
+  # When set, the chart uses this secret and the install script skips
+  # credential creation entirely.
+  # When empty, the install script creates a secret named
+  # '<release-name>-storage-credentials' automatically.
+  secretName: ""
 
   # S3 region for signature generation (required for S3v4 signatures)
-  # NooBaa/MinIO don't use regions, but boto3 requires it for signature calculation
+  # Most S3-compatible backends (NooBaa, S4, Ceph) don't use regions,
+  # but boto3 requires it for signature calculation.
   # Default: "onprem" (for on-premise deployments)
   # Override to AWS region (e.g., "us-east-1") if deploying to AWS S3
   s3:
@@ -920,29 +789,21 @@ jwtAuth:
   # Keycloak configuration for JWT validation
   # Supported operator: Red Hat Build of Keycloak (RHBK) v22+ - k8s.keycloak.org/v2alpha1
   keycloak:
-    # Keycloak URL - leave empty for automatic runtime discovery
-    #
-    # Runtime Discovery (when url is empty):
-    #   1. Searches for Keycloak Route in common namespaces (keycloak, keycloak-system)
-    #   2. Falls back to Keycloak Service discovery (cluster-local)
-    #   3. Fails with helpful message if not found
-    #
-    # Override only if using custom/external Keycloak instance
+    # Keycloak URL (detected by install script; defaults to internal cluster URL for offline templating)
+    # Override for custom/external Keycloak instances
     url: ""  # e.g., "https://keycloak-keycloak.apps.example.com"
 
-    # Keycloak namespace - leave empty for automatic discovery
-    # Set this if Keycloak is deployed in a custom namespace that doesn't match
-    # the standard patterns (keycloak, keycloak-system)
+    # Keycloak namespace (defaults to "keycloak" when empty)
+    # Override if Keycloak is deployed in a non-standard namespace
     namespace: ""  # e.g., "my-auth-namespace"
 
-    # Keycloak service port for internal cluster-local discovery fallback
-    # Only used when discovering Keycloak via Service (not Route)
+    # Keycloak service port for internal cluster-local URL construction
     servicePort: 8080
 
     # Keycloak realm name
     realm: kubernetes
 
-    # Client configuration (for reference - used by Cost Management Operator)
+    # Client configuration (for reference - used by Cost Management Metrics Operator)
     client:
       id: cost-management-operator
 

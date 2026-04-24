@@ -173,11 +173,39 @@ pytest tests/suites/e2e/test_scenarios.py -v -m scenario  # YAML-driven scenario
 
 ### Using Pytest Directly
 
+> **Note:** Running `pytest` directly requires manual dependency setup. The `run-pytest.sh` 
+> script handles this automatically. If you prefer running pytest directly, follow the 
+> setup steps below.
+
+**Manual Setup (required before running pytest directly):**
+
 ```bash
 cd tests
 
-# All tests
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install koku-nise for E2E data generation (optional)
+pip install koku-nise
+
+# Install Playwright browsers (required for UI tests)
+playwright install chromium --with-deps
+```
+
+**Running Tests:**
+
+```bash
+cd tests
+
+# All tests (includes UI - requires Playwright)
 pytest
+
+# Exclude UI tests (no Playwright required)
+pytest -m "not ui"
 
 # By marker
 pytest -m helm
@@ -201,6 +229,10 @@ pytest -v
 # Stop on first failure
 pytest -x
 ```
+
+> **UI Tests:** Running `pytest` without `-m "not ui"` will include UI tests, which require
+> Playwright and browser binaries. Use `pytest -m "not ui"` to skip them, or install 
+> Playwright first with `playwright install chromium --with-deps`.
 
 ## Test Markers
 
@@ -252,8 +284,7 @@ The `e2e_helpers.py` module centralizes common E2E functionality to avoid duplic
 | `is_nise_available()` / `install_nise()` | NISE availability checking and installation |
 | `generate_nise_data()` | Generate NISE data with categorized file output |
 | `generate_cluster_id()` | Generate unique cluster IDs |
-| `get_koku_api_reads_url()` | Get internal Koku API URL for GET operations |
-| `get_koku_api_writes_url()` | Get internal Koku API URL for POST/PUT/DELETE operations |
+| `get_koku_api_url()` | Get internal Koku API URL (unified deployment) |
 | `register_source()` / `delete_source()` | Source registration with proper `source_ref` |
 | `upload_with_retry()` | Upload with retry logic for transient errors |
 | `wait_for_provider()` / `wait_for_summary_tables()` | Processing wait utilities |
@@ -315,12 +346,12 @@ release/ci-operator/step-registry/insights-onprem/cost-onprem-chart/e2e/
 
 **CI Execution Sequence:**
 1. Dependencies installed (yq, kubectl, helm, oc)
-2. MinIO configured from `insights-onprem-minio-deploy` step
-3. Cost Management Operator installed via OLM
-4. Helm wrapper injects MinIO storage config
+2. S4 configured from `insights-onprem-s4-deploy` step
+3. Cost Management Metrics Operator installed via OLM
+4. Helm wrapper injects S4 storage config
 5. `scripts/deploy-test-cost-onprem.sh` runs:
    - Deploys RHBK (Keycloak)
-   - Deploys Strimzi/Kafka
+   - Deploys AMQ Streams/Kafka
    - Installs cost-onprem Helm chart
    - Configures TLS
    - **Runs `scripts/run-pytest.sh`** (CI mode)

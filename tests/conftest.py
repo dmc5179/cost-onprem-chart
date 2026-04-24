@@ -5,7 +5,11 @@ This is the root conftest.py that provides shared fixtures used across all test 
 Suite-specific fixtures are defined in each suite's conftest.py.
 """
 
+import base64
+import json
+import logging
 import os
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -16,7 +20,15 @@ import pytest
 import requests
 import urllib3
 
-from utils import get_route_url, get_secret_value, run_oc_command
+
+from utils import (
+    check_pod_exists,
+    exec_in_pod,
+    get_pod_by_label,
+    get_route_url,
+    get_secret_value,
+    run_oc_command,
+)
 
 # Import shared fixtures from test suites
 # These fixtures are available to all test suites
@@ -82,8 +94,8 @@ class DatabaseConfig:
 
     pod_name: str
     namespace: str
-    database: str = "costonprem_koku"
-    user: str = "costonprem_koku"
+    database: str = "costonprem_koku"  # Chart default from values.yaml
+    user: str = "koku_user"  # Chart default from values.yaml
     password: Optional[str] = None
 
 
@@ -249,33 +261,205 @@ def ingress_url(gateway_url: str) -> str:
     return f"{base}/api/ingress"
 
 
+# =============================================================================
+# Database Discovery Helpers
+# =============================================================================
+
+@dataclass
+class DbHostLookup:
+    """Maps a Kubernetes pod label to the environment variable that holds the resolved DB host."""
+
+    label: str
+    env_var: str
+
+
+_DB_HOST_LOOKUPS = [
+    DbHostLookup(label="app.kubernetes.io/component=ros-api", env_var="DB_HOST"),
+    DbHostLookup(label="app.kubernetes.io/component=cost-management-api", env_var="DATABASE_SERVICE_HOST"),
+    DbHostLookup(label="app.kubernetes.io/component=cost-processor", env_var="DATABASE_SERVICE_HOST"),
+]
+
+
+def _get_db_host_from_app_pod(cluster_config: ClusterConfig) -> Optional[str]:
+    """Read the database host from a running app pod's environment.
+
+    The Helm templates resolve the database host (bundled or external) and inject
+    it as an environment variable into every app pod.  Reading it back gives us
+    the concrete hostname without needing to parse Helm values or sentinels.
+    """
+    for lookup in _DB_HOST_LOOKUPS:
+        pod = get_pod_by_label(cluster_config.namespace, lookup.label)
+        if pod:
+            result = exec_in_pod(
+                cluster_config.namespace, pod, ["printenv", lookup.env_var]
+            )
+            if result and result.strip():
+                return result.strip()
+    return None
+
+
+@dataclass
+class ParsedService:
+    """A Kubernetes service parsed from its FQDN."""
+
+    namespace: str
+    name: str
+
+
+def _parse_k8s_service(hostname: str) -> Optional[ParsedService]:
+    """Parse a Kubernetes service FQDN into a ParsedService.
+
+    Handles forms like:
+      postgresql.byoi-infra.svc.cluster.local  -> ParsedService("byoi-infra", "postgresql")
+      postgresql.byoi-infra.svc                -> ParsedService("byoi-infra", "postgresql")
+    Returns None for non-FQDN hostnames.
+    """
+    parts = hostname.split(".")
+    if len(parts) >= 3 and "svc" in parts:
+        svc_idx = parts.index("svc")
+        if svc_idx >= 2:
+            return ParsedService(
+                namespace=parts[svc_idx - 1],
+                name=parts[svc_idx - 2],
+            )
+    return None
+
+
+def _find_db_pod(namespace: str, service_name: str) -> Optional[str]:
+    """Find the database pod backing a Kubernetes service.
+
+    Tries service endpoints first, then falls back to common PostgreSQL labels.
+    """
+    # Try endpoints (most reliable – works for any service type)
+    result = run_oc_command([
+        "get", "endpoints", service_name, "-n", namespace,
+        "-o", "jsonpath={.subsets[0].addresses[0].targetRef.name}"
+    ], check=False)
+    if result.stdout.strip():
+        return result.stdout.strip()
+
+    # Fallback: common PostgreSQL label selectors
+    for label in [
+        "app.kubernetes.io/component=database",
+        "app=postgresql",
+        "app.kubernetes.io/name=postgresql",
+    ]:
+        pod = get_pod_by_label(namespace, label)
+        if pod:
+            return pod
+    return None
+
+
+@pytest.fixture(scope="session")
+def database_deployed(cluster_config: ClusterConfig) -> bool:
+    """Detect whether the chart deployed a bundled database pod.
+
+    Returns True for default (bundled) deployments, False for BYOI.
+    Used only by tests that verify chart-created resources (pod exists, service exists).
+    """
+    return check_pod_exists(
+        cluster_config.namespace, "app.kubernetes.io/component=database"
+    )
+
+
 @pytest.fixture(scope="session")
 def database_config(cluster_config: ClusterConfig) -> DatabaseConfig:
-    """Get database configuration for Koku."""
-    # Find database pod
-    result = run_oc_command([
-        "get", "pods", "-n", cluster_config.namespace,
-        "-l", "app.kubernetes.io/component=database",
-        "-o", "jsonpath={.items[0].metadata.name}"
-    ], check=False)
-    
-    db_pod = result.stdout.strip()
+    """Discover the database pod and return Koku database configuration.
+
+    Single code path for both bundled and BYOI deployments:
+    1. Read the resolved DB_HOST from a running app pod
+    2. Parse the hostname to determine namespace and service
+    3. Find the actual database pod via service endpoints
+    4. Detect the actual database name from the Koku deployment
+    """
+    # Step 1: Get the resolved DB host from any running app pod
+    db_host = _get_db_host_from_app_pod(cluster_config)
+    if not db_host:
+        pytest.skip(
+            "Cannot determine database host (no app pod with DB_HOST found)"
+        )
+
+    # Step 2: Resolve hostname to namespace + service name
+    if ".svc" in db_host:
+        # FQDN: "postgresql.byoi-infra.svc.cluster.local"
+        parsed = _parse_k8s_service(db_host)
+        if not parsed:
+            pytest.skip(f"Cannot parse k8s service from DB host: {db_host}")
+        db_namespace = parsed.namespace
+        service_name = parsed.name
+    else:
+        # Simple name: "cost-onprem-database" (same namespace)
+        db_namespace = cluster_config.namespace
+        service_name = db_host
+
+    # Step 3: Find the actual database pod
+    db_pod = _find_db_pod(db_namespace, service_name)
     if not db_pod:
-        # Try fallback pod name
-        db_pod = f"{cluster_config.helm_release_name}-database-0"
-    
-    # Get credentials from secret
+        pytest.skip(
+            f"Cannot locate database pod for host: {db_host} "
+            f"(namespace: {db_namespace})"
+        )
+
+    # Step 4: Get credentials from chart secret (always in chart namespace)
     secret_name = f"{cluster_config.helm_release_name}-db-credentials"
     db_user = get_secret_value(cluster_config.namespace, secret_name, "koku-user")
     db_password = get_secret_value(cluster_config.namespace, secret_name, "koku-password")
-    
+
     if not db_user:
-        db_user = "costonprem_koku"
-    
+        db_user = "koku_user"  # Chart default from values.yaml
+
+    # Detect actual database name from Koku deployment (unified koku-api)
+    db_name_result = run_oc_command([
+        "get", "deployment", f"{cluster_config.helm_release_name}-koku-api",
+        "-n", cluster_config.namespace,
+        "-o", "jsonpath={.spec.template.spec.containers[0].env[?(@.name=='DATABASE_NAME')].value}"
+    ], check=False)
+
+    db_name = db_name_result.stdout.strip() if db_name_result.returncode == 0 else ""
+    if not db_name:
+        db_name = "costonprem_koku"  # Chart default from values.yaml
+
     return DatabaseConfig(
         pod_name=db_pod,
-        namespace=cluster_config.namespace,
-        database="costonprem_koku",
+        namespace=db_namespace,
+        database=db_name,
+        user=db_user,
+        password=db_password,
+    )
+
+
+@pytest.fixture(scope="session")
+def kruize_database_config(
+    cluster_config: ClusterConfig, database_config: DatabaseConfig
+) -> DatabaseConfig:
+    """Get database configuration for Kruize.
+
+    Reuses the database pod discovered by database_config (same unified server)
+    and detects the Kruize database name from the Kruize deployment.
+    """
+    # Get Kruize credentials from secret (always in chart namespace)
+    secret_name = f"{cluster_config.helm_release_name}-db-credentials"
+    db_user = get_secret_value(cluster_config.namespace, secret_name, "kruize-user")
+    db_password = get_secret_value(cluster_config.namespace, secret_name, "kruize-password")
+
+    if not db_user:
+        db_user = "kruize_user"
+
+    # Detect actual database name from Kruize deployment
+    db_name_result = run_oc_command([
+        "get", "deployment", f"{cluster_config.helm_release_name}-kruize",
+        "-n", cluster_config.namespace,
+        "-o", "jsonpath={.spec.template.spec.containers[0].env[?(@.name=='database_name')].value}"
+    ], check=False)
+
+    db_name = db_name_result.stdout.strip() if db_name_result.returncode == 0 else ""
+    if not db_name:
+        db_name = "costonprem_kruize"  # Default from values.yaml
+
+    return DatabaseConfig(
+        pod_name=database_config.pod_name,
+        namespace=database_config.namespace,
+        database=db_name,
         user=db_user,
         password=db_password,
     )
@@ -307,7 +491,7 @@ def s3_config(cluster_config: ClusterConfig) -> Optional[S3Config]:
         f"{cluster_config.namespace}-storage-credentials",  # Namespace-based
         "cost-onprem-storage-credentials",  # Default helm release name
         "koku-storage-credentials",  # Legacy name
-        f"{cluster_config.helm_release_name}-odf-credentials",  # ODF credentials
+        f"{cluster_config.helm_release_name}-object-storage-credentials",  # Object storage credentials
     ]
     
     access_key = None
@@ -329,11 +513,95 @@ def s3_config(cluster_config: ClusterConfig) -> Optional[S3Config]:
     )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def s3_bucket_preflight(cluster_config: ClusterConfig, s3_config: Optional[S3Config]) -> None:
+    """Pre-flight check: Ensure required S3 buckets exist before running tests.
+
+    This fixture runs automatically at the start of the test session and creates
+    any missing S3 buckets. This prevents test failures due to missing buckets
+    when the install script's bucket creation fails (e.g., network issues
+    downloading the S3 client).
+
+    Required buckets (from values.yaml):
+    - koku-bucket: Main cost data storage
+    - ros-data: ROS processor data
+    - insights-upload-perma: Ingress upload storage
+    """
+    if s3_config is None:
+        # No S3 config available - skip bucket check
+        # Tests that need S3 will fail with appropriate errors
+        return
+
+    required_buckets = ["koku-bucket", "ros-data", "insights-upload-perma"]
+
+    # Execute bucket check/creation inside the koku-api pod which has boto3 and credentials
+    bucket_check_script = f'''
+import boto3
+import os
+import sys
+
+s3 = boto3.client('s3',
+    endpoint_url=os.environ.get('S3_ENDPOINT', '{s3_config.endpoint}'),
+    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+    verify=False
+)
+
+required_buckets = {required_buckets!r}
+created = []
+existing = []
+failed = []
+
+for bucket in required_buckets:
+    try:
+        s3.head_bucket(Bucket=bucket)
+        existing.append(bucket)
+    except s3.exceptions.ClientError as e:
+        error_code = e.response.get('Error', {{}}).get('Code', '')
+        if error_code in ('404', 'NoSuchBucket'):
+            try:
+                s3.create_bucket(Bucket=bucket)
+                created.append(bucket)
+            except Exception as create_err:
+                failed.append((bucket, str(create_err)))
+        else:
+            failed.append((bucket, str(e)))
+    except Exception as e:
+        failed.append((bucket, str(e)))
+
+if existing:
+    print(f"Existing buckets: {{', '.join(existing)}}")
+if created:
+    print(f"Created buckets: {{', '.join(created)}}")
+if failed:
+    print(f"Failed buckets: {{failed}}", file=sys.stderr)
+    sys.exit(1)
+'''
+
+    # Run the script inside the koku-api pod
+    result = run_oc_command(
+        [
+            "exec", "-n", cluster_config.namespace,
+            "deployment/cost-onprem-koku-api", "--",
+            "python3", "-c", bucket_check_script
+        ],
+        check=False,
+    )
+
+    if result.returncode != 0:
+        pytest.fail(
+            f"S3 bucket pre-flight check failed: {result.stderr}\n"
+            "Required buckets could not be created: koku-bucket, ros-data, insights-upload-perma\n"
+            "Check S3/object storage configuration and connectivity."
+        )
+    elif result.stdout.strip():
+        # Log bucket status for visibility
+        print(f"\n[S3 Pre-flight] {result.stdout.strip()}")
+
+
 @pytest.fixture(scope="session")
 def org_id(cluster_config: ClusterConfig, keycloak_config: KeycloakConfig) -> str:
     """Get org_id from Keycloak test user or use default."""
-    import base64
-    
     try:
         # Get admin credentials
         admin_pass_result = run_oc_command([
@@ -454,3 +722,235 @@ def http_session() -> requests.Session:
     session = requests.Session()
     session.verify = False
     return session
+
+
+# =============================================================================
+# External API Access Fixtures (for api/ tests)
+# =============================================================================
+
+
+@pytest.fixture(scope="function")
+def authenticated_session(jwt_token: JWTToken) -> requests.Session:
+    """Pre-configured requests session with JWT authentication.
+    
+    Scope: function - Matches jwt_token scope to ensure fresh auth per test.
+    
+    Use this fixture for external API tests that go through the gateway.
+    The session includes:
+    - Authorization header with Bearer token
+    - SSL verification disabled (for self-signed certs)
+    
+    Note: Content-Type is NOT set by default to allow multipart/form-data
+    uploads to work correctly. Set it explicitly in tests that need JSON.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {jwt_token.access_token}",
+    })
+    session.verify = False
+    return session
+
+
+# =============================================================================
+# Internal Cluster Access Fixtures (for internal/ tests)
+# =============================================================================
+
+
+def _apply_test_network_policies(namespace: str, helm_release_name: str) -> None:
+    """Create NetworkPolicies allowing the test runner pod to reach internal services.
+
+    The chart's NetworkPolicies restrict ingress to the Koku API to specific
+    components (gateway, ingress, housekeeper). The test runner pod is not in
+    that allow-list, so direct pod-to-pod requests from the test runner time
+    out. This function creates an additive NetworkPolicy that permits traffic
+    from pods labelled ``app.kubernetes.io/component: testing`` to reach the
+    cost-management-api pods on port 8000.
+
+    Applied idempotently via ``oc apply`` so it is safe to call on every
+    session regardless of prior state.
+    """
+    netpol = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": "allow-test-runner-to-cost-api",
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/part-of": "cost-onprem-tests",
+                "app.kubernetes.io/managed-by": "pytest",
+            },
+        },
+        "spec": {
+            "podSelector": {
+                "matchLabels": {
+                    "app.kubernetes.io/instance": helm_release_name,
+                    "app.kubernetes.io/component": "cost-management-api",
+                }
+            },
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": [
+                        {
+                            "podSelector": {
+                                "matchLabels": {
+                                    "app.kubernetes.io/component": "testing",
+                                }
+                            }
+                        }
+                    ],
+                    "ports": [{"protocol": "TCP", "port": 8000}],
+                }
+            ],
+        },
+    }
+
+    result = subprocess.run(
+        ["oc", "apply", "-n", namespace, "-f", "-"],
+        input=json.dumps(netpol),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        # Non-fatal: log but don't block the session — the tests will
+        # fail with timeouts and the cause will be obvious.
+        logging.getLogger(__name__).warning(
+            "Failed to create test NetworkPolicy: %s", result.stderr
+        )
+
+
+def _delete_test_network_policies(namespace: str) -> None:
+    """Remove NetworkPolicies created by the test session."""
+    run_oc_command(
+        [
+            "delete", "networkpolicy",
+            "allow-test-runner-to-cost-api",
+            "-n", namespace,
+            "--ignore-not-found",
+        ],
+        check=False,
+    )
+
+
+@pytest.fixture(scope="session")
+def test_runner_pod(cluster_config: ClusterConfig):
+    """Dedicated test runner pod for internal cluster commands.
+
+    Provides a consistent environment for executing commands inside the cluster
+    without depending on application pod availability.
+
+    Benefits:
+    - Isolation: Tests don't interfere with application pods
+    - Consistent tooling: Same tools available regardless of app pods
+    - No container guessing: Don't need to find "a pod that has curl"
+    - Cleaner logs: Test output doesn't pollute application logs
+
+    The pod and its companion NetworkPolicy are created at session start and
+    cleaned up at session end (unless E2E_CLEANUP_AFTER=false).
+    """
+    namespace = cluster_config.namespace
+    pod_name = "cost-onprem-test-runner"
+
+    # Ensure the test runner is allowed through the chart's NetworkPolicies.
+    # Applied idempotently so it is safe in both the "pod already exists" and
+    # "create new pod" paths.
+    _apply_test_network_policies(namespace, cluster_config.helm_release_name)
+
+    # Check if pod already exists and is ready
+    check_result = run_oc_command([
+        "get", "pod", pod_name, "-n", namespace,
+        "-o", "jsonpath={.status.phase}"
+    ], check=False)
+
+    if check_result.returncode == 0 and check_result.stdout.strip() == "Running":
+        # Pod already exists and is running
+        yield pod_name
+        # Don't delete if we didn't create it
+        return
+
+    # Delete any existing pod that's not running
+    run_oc_command([
+        "delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"
+    ], check=False)
+
+    pod_manifest = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name,
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/name": "test-runner",
+                "app.kubernetes.io/component": "testing",
+                "app.kubernetes.io/part-of": "cost-onprem-tests",
+            }
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "runner",
+                "image": "registry.access.redhat.com/ubi9/ubi:latest",
+                "command": ["sleep", "infinity"],
+                "resources": {
+                    "requests": {"memory": "64Mi", "cpu": "100m"},
+                    "limits": {"memory": "256Mi", "cpu": "500m"}
+                }
+            }]
+        }
+    }
+
+    result = subprocess.run(
+        ["oc", "apply", "-n", namespace, "-f", "-"],
+        input=json.dumps(pod_manifest),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        pytest.skip(f"Failed to create test runner pod: {result.stderr}")
+
+    # Wait for pod to be ready
+    wait_result = run_oc_command([
+        "wait", "pod", pod_name, "-n", namespace,
+        "--for=condition=Ready", "--timeout=120s"
+    ], check=False)
+
+    if wait_result.returncode != 0:
+        # Clean up failed pod
+        run_oc_command(["delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"], check=False)
+        pytest.skip(f"Test runner pod failed to become ready: {wait_result.stderr}")
+
+    yield pod_name
+
+    # Cleanup (unless E2E_CLEANUP_AFTER=false)
+    if os.environ.get("E2E_CLEANUP_AFTER", "true").lower() == "true":
+        _delete_test_network_policies(namespace)
+        run_oc_command([
+            "delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"
+        ], check=False)
+
+
+@pytest.fixture(scope="session")
+def internal_api_url(cluster_config: ClusterConfig) -> str:
+    """Internal Koku API URL (ClusterIP service).
+    
+    Use this for tests that need to bypass the gateway and test
+    Koku API directly via internal service networking.
+    
+    Format: http://{release}-koku-api.{namespace}.svc:8000
+    """
+    return f"http://{cluster_config.helm_release_name}-koku-api.{cluster_config.namespace}.svc:8000"
+
+
+@pytest.fixture(scope="session")
+def internal_ros_api_url(cluster_config: ClusterConfig) -> str:
+    """Internal ROS API URL (ClusterIP service).
+    
+    Use this for tests that need to bypass the gateway and test
+    ROS API directly via internal service networking.
+    
+    Format: http://{release}-ros-api.{namespace}.svc:8000
+    """
+    return f"http://{cluster_config.helm_release_name}-ros-api.{cluster_config.namespace}.svc:8000"

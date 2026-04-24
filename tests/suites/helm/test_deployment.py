@@ -51,8 +51,10 @@ class TestDeploymentHealth:
     """Tests for deployment health after Helm install."""
 
     @pytest.mark.smoke
-    def test_database_pod_ready(self, cluster_config):
-        """Verify database pod is ready."""
+    def test_database_pod_ready(self, cluster_config, database_deployed):
+        """Verify database pod is ready (bundled deployments only)."""
+        if not database_deployed:
+            pytest.skip("Database not deployed by chart (BYOI mode)")
         assert check_pod_ready(
             cluster_config.namespace,
             "app.kubernetes.io/component=database"
@@ -89,11 +91,20 @@ class TestDeploymentHealth:
 
     def test_koku_api_pod_ready(self, cluster_config):
         """Verify Koku API pod is ready (provides cost management and sources endpoints)."""
-        # Check the writes pod since it handles source registration
         assert check_pod_ready(
             cluster_config.namespace,
-            "app.kubernetes.io/component=cost-management-api-writes"
-        ), "Koku API (writes) pod is not ready"
+            "app.kubernetes.io/component=cost-management-api"
+        ), "Koku API pod is not ready"
+
+    def test_ui_pod_ready(self, cluster_config):
+        """Verify UI pod is ready.
+        
+        FLPATH-3855: Verify UI Component Deployment
+        """
+        assert check_pod_ready(
+            cluster_config.namespace,
+            "app.kubernetes.io/component=ui"
+        ), "UI pod is not ready"
 
 
 @pytest.mark.helm
@@ -101,7 +112,7 @@ class TestDeploymentHealth:
 class TestServices:
     """Tests for Kubernetes services."""
 
-    def test_services_exist(self, cluster_config):
+    def test_services_exist(self, cluster_config, database_deployed):
         """Verify expected services exist."""
         result = run_oc_command([
             "get", "services", "-n", cluster_config.namespace,
@@ -112,8 +123,11 @@ class TestServices:
         
         expected_services = [
             f"{cluster_config.helm_release_name}-ingress",
-            f"{cluster_config.helm_release_name}-database",
         ]
+        if database_deployed:
+            expected_services.append(
+                f"{cluster_config.helm_release_name}-database"
+            )
         
         for svc in expected_services:
             assert svc in services, f"Service '{svc}' not found"

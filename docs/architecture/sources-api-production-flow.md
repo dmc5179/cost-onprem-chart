@@ -82,7 +82,7 @@ Key environment variables:
 
 ```bash
 # Run E2E test (uses Koku Sources API automatically)
-./scripts/test-ocp-dataflow-jwt.sh --namespace cost-onprem
+NAMESPACE=cost-onprem ./scripts/run-pytest.sh --e2e
 ```
 
 ## Flow Details
@@ -166,7 +166,7 @@ The ros-ocp-backend housekeeper no longer queries sources-api-go for application
 
 **Check Koku API logs:**
 ```bash
-oc logs -n cost-onprem -l app.kubernetes.io/component=cost-management-api-writes --tail=50
+oc logs -n cost-onprem -l app.kubernetes.io/component=cost-management-api --tail=50
 ```
 
 **Check Koku listener logs:**

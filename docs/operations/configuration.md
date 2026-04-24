@@ -8,6 +8,8 @@ Complete configuration reference for resource requirements, storage, and access 
 - [Access Points](#access-points)
 - [Configuration Values](#configuration-values)
 - [Platform-Specific Configuration](#platform-specific-configuration)
+- [External Infrastructure (BYOI)](#external-infrastructure-byoi)
+- [Security Configuration](#security-configuration)
 
 ## Resource Requirements
 
@@ -25,7 +27,7 @@ Complete configuration reference for resource requirements, storage, and access 
 | Service | CPU Request | CPU Limit |
 |---------|-------------|-----------|
 | PostgreSQL (3×) | 300m | 1500m |
-| Kafka + Zookeeper | 350m | 750m |
+| Kafka (KRaft) | 350m | 750m |
 | Kruize | 500m | 1000m |
 | Application Services | 800m | 1200m |
 | **Total** | **~2 cores** | **~4.5 cores** |
@@ -34,7 +36,7 @@ Complete configuration reference for resource requirements, storage, and access 
 | Service | Memory Request | Memory Limit |
 |---------|----------------|--------------|
 | PostgreSQL (3×) | 768MB | 1536MB |
-| Kafka + Zookeeper | 768MB | 1536MB |
+| Kafka (KRaft) | 768MB | 1536MB |
 | Kruize | 1GB | 2GB |
 | Application Services | 2GB | 3GB |
 | **Total** | **~4.5GB** | **~8GB** |
@@ -45,15 +47,15 @@ Complete configuration reference for resource requirements, storage, and access 
 | PostgreSQL ROS | 10GB | RWO | Main database |
 | PostgreSQL Kruize | 10GB | RWO | Kruize database |
 | PostgreSQL Koku | 10GB | RWO | Koku database (includes sources data) |
-| Kafka | 10GB | RWO | Message storage |
-| Zookeeper | 5GB | RWO | Coordination data |
+| Kafka Brokers | 10GB | RWO | Message storage |
+| Kafka Controllers | 5GB | RWO | KRaft metadata |
 | **Total** | **~45GB** | - | Production: 50GB+ |
 
 ---
 
 ## Namespace Requirements
 
-### Cost Management Operator Label
+### Cost Management Metrics Operator Label
 
 **REQUIRED**: The deployment namespace must be labeled for the Cost Management Metrics Operator to collect resource optimization data.
 
@@ -98,16 +100,16 @@ insights_cost_management_optimizations: "true"
 
 **Base Requirements:**
 - SNO cluster running OpenShift 4.18+
-- OpenShift Data Foundation (ODF) installed
-- 30GB+ block devices for ODF
+- S3-compatible object storage (ODF, S4, AWS S3, or any S3 provider)
+- Block storage for databases and Kafka (ODF or any RWO-capable storage class)
 
 **Additional Resources for Cost Management On-Premise:**
 - **Additional Memory**: 6GB+ RAM
 - **Additional CPU**: 2+ cores
 - **Total Node**: SNO minimum + ROS requirements
 
-**ODF Configuration:**
-- **Storage Class**: `ocs-storagecluster-ceph-rbd` (auto-detected)
+**Block Storage Configuration (for databases/Kafka):**
+- **Storage Class**: `ocs-storagecluster-ceph-rbd` (auto-detected on ODF) or any RWO storage class
 - **Volume Mode**: Filesystem
 - **Access Mode**: ReadWriteOnce (RWO)
 
@@ -115,21 +117,94 @@ insights_cost_management_optimizations: "true"
 
 ## Storage Configuration
 
-### ODF Storage Backend
+This chart requires S3-compatible object storage. Any backend that speaks the S3 API is supported. The chart does **not** require ODF — it is one option among several.
 
-The chart uses OpenShift Data Foundation (ODF) for object storage.
+There are two ways to configure storage:
 
-### ODF Configuration
+1. **Manual** (production): Set `objectStorage.*` in your values file and pre-create a credentials secret. The install script skips all S3 auto-detection.
+2. **Automated** (dev/CI): Leave `objectStorage.endpoint` empty and let the install script auto-detect from the cluster (OBC, S4, or NooBaa).
 
-**Prerequisites:**
-- ODF installed in `openshift-storage` namespace
-- **Direct Ceph RGW recommended** (strong consistency)
-- ObjectBucketClaim (OBC) provisioned OR S3 credentials secret created
+### Required Buckets
 
-**Recommended Setup (Direct Ceph RGW with OBC):**
+The following S3 buckets must exist before the chart is deployed. Bucket names are configurable in `values.yaml`:
+
+| Purpose | Values Key | Default Name |
+|---------|-----------|--------------|
+| Ingress uploads | `ingress.storage.bucket` | `insights-upload-perma` |
+| Koku cost data | `costManagement.storage.bucketName` | `koku-bucket` |
+| ROS data | `costManagement.storage.rosBucketName` | `ros-data` |
+
+### Credentials Secret Format
+
+All configuration paths require a Kubernetes Secret with these exact keys:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: <your-secret-name>
+type: Opaque
+stringData:
+  access-key: "<S3_ACCESS_KEY>"
+  secret-key: "<S3_SECRET_KEY>"
+```
+
+### Storage Backend Comparison
+
+| Backend | Consistency | Auto-Detected | Notes |
+|---------|-------------|---------------|-------|
+| **AWS S3** | Strong | No — manual config | For disconnected AWS deployments |
+| **Direct Ceph RGW** | Strong | Yes — via OBC | Recommended for ODF clusters |
+| **S4 (Ceph RGW)** | Strong | Yes — via `S3_ENDPOINT` | For development/testing |
+| **NooBaa** | Eventual | Yes — fallback | ⚠️ Not recommended (causes 403 errors) |
+
+---
+
+### Option A: AWS S3 (Manual Configuration)
+
+Use this when deploying on AWS (disconnected or otherwise) with native S3 storage. The install script does not auto-detect AWS S3, so all configuration is provided via `values.yaml`.
+
+**Prerequisites:** S3 buckets already created and IAM credentials available. The three required buckets are listed in the [Required Buckets](#required-buckets) table above.
+
+**Step 1: Create the credentials secret in the target namespace**
 
 ```bash
-# Create ObjectBucketClaim for Ceph RGW
+kubectl create secret generic aws-s3-credentials \
+  --namespace cost-onprem \
+  --from-literal=access-key="<YOUR_ACCESS_KEY>" \
+  --from-literal=secret-key="<YOUR_SECRET_KEY>"
+```
+
+**Step 2: Configure `values.yaml`**
+
+```yaml
+objectStorage:
+  endpoint: "s3.amazonaws.com"       # Or regional: s3.us-east-1.amazonaws.com
+  port: 443
+  useSSL: true
+  secretName: "aws-s3-credentials"
+  s3:
+    region: "us-east-1"             # Must match the bucket region
+```
+
+**Step 3: Run the install script**
+
+```bash
+VALUES_FILE=my-aws-values.yaml \
+  ./scripts/install-helm-chart.sh --namespace cost-onprem
+```
+
+The script detects that `objectStorage.endpoint` is already set and skips all S3 auto-detection, credential creation, and bucket creation.
+
+---
+
+### Option B: ODF with Direct Ceph RGW (OBC Auto-Detection)
+
+Use this on OpenShift clusters with ODF installed. Direct Ceph RGW is recommended over NooBaa because it provides strong read-after-write consistency.
+
+**Step 1: Create an ObjectBucketClaim**
+
+```bash
 cat <<EOF | oc apply -f -
 apiVersion: objectbucket.io/v1alpha1
 kind: ObjectBucketClaim
@@ -138,68 +213,59 @@ metadata:
   namespace: cost-onprem
 spec:
   generateBucketName: ros-data-ceph
-  storageClassName: ocs-storagecluster-ceph-rgw  # Direct Ceph RGW
+  storageClassName: ocs-storagecluster-ceph-rgw
 EOF
 
 # Wait for provisioning
 oc wait --for=condition=Ready obc/ros-data-ceph -n cost-onprem --timeout=5m
-
-# OBC auto-detection happens automatically during Helm installation
 ```
 
-**OBC Auto-Detection:**
+**Step 2: Run the install script**
 
-The installation script automatically:
-- Detects existing ObjectBucketClaims in the namespace
+```bash
+./scripts/install-helm-chart.sh --namespace cost-onprem
+```
+
+The script automatically:
+- Detects the OBC named `ros-data-ceph` in the namespace
 - Extracts bucket name, endpoint, port, and credentials
-- Creates storage credentials secret from OBC
-- Configures Helm deployment with correct values
+- Creates the storage credentials secret
+- Passes `objectStorage.endpoint`, `objectStorage.port`, etc. to Helm via `--set`
 
-**Configuration:**
-```yaml
-odf:
-  endpoint: ""  # Auto-detected from OBC or specify manually
-  port: 443
-  useSSL: true
-  bucket: "ros-data"  # Auto-detected from OBC
-  
-  # External ObjectBucketClaim configuration
-  useExternalOBC: false  # Set to true when using pre-created OBC
-```
+No `values.yaml` changes needed for this path.
 
-**Manual Configuration (if not using OBC auto-detection):**
+**Manual ODF configuration** (if not using OBC auto-detection):
+
 ```yaml
-odf:
+objectStorage:
   endpoint: "rook-ceph-rgw-ocs-storagecluster-cephobjectstore.openshift-storage.svc"
-  s3:
-    region: "onprem"  # Default for NooBaa/MinIO; use "us-east-1" for AWS S3
-  bucket: "ros-data-ceph-bfe1f304-xxx"  # From OBC ConfigMap
-  pathStyle: true
-  useSSL: true
   port: 443
-  credentials:
-    secretName: "cost-onprem-storage-credentials"  # Auto-created from OBC
+  useSSL: true
+  secretName: ""  # Let the install script create it from NooBaa credentials
+  s3:
+    region: "onprem"
 ```
 
-**Storage Class Comparison:**
+---
 
-| Storage Backend | StorageClass | Consistency | Status |
-|----------------|--------------|-------------|--------|
-| **Direct Ceph RGW** | `ocs-storagecluster-ceph-rgw` | Strong | ✅ **Recommended** |
-| **NooBaa** | `ocs-storagecluster-ceph-rbd` | Eventual | ⚠️ Not Recommended |
-| **MinIO** | Any | Strong | ✅ Supported |
-| **AWS S3** | N/A (external) | Strong | ✅ Supported |
+### Option C: S4 (Development/Testing)
 
-**Why Direct Ceph RGW?**
-- Strong read-after-write consistency
-- No 403 errors on freshly uploaded files
-- Immediate availability of objects
-- Better performance for ROS processing
+Use this for local development or testing on OCP clusters without dedicated object storage.
 
-**Access:**
-- **Internal**: `rook-ceph-rgw-ocs-storagecluster-cephobjectstore.openshift-storage.svc`
-- **Port**: 443 (HTTPS)
-- **Credentials**: Auto-extracted from OBC or manually created secret
+See [S4 Development Setup Guide](../development/ocp-dev-setup-s4.md) for full instructions.
+
+**Quick start:**
+
+```bash
+# Deploy S4
+./scripts/deploy-s4-test.sh cost-onprem
+
+# Install chart with S4
+S3_ENDPOINT=s4.cost-onprem.svc.cluster.local S3_PORT=7480 S3_USE_SSL=false \
+  ./scripts/install-helm-chart.sh --namespace cost-onprem
+```
+
+The script auto-detects `S3_ENDPOINT`, creates storage credentials from the S4 secret, creates buckets, and passes `objectStorage.endpoint`, `objectStorage.port=7480`, `objectStorage.useSSL=false` to Helm.
 
 ### Storage Class Configuration
 
@@ -313,6 +379,52 @@ gatewayRoute:
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
 ```
+
+---
+
+## Cluster-Specific Values (Required Overrides)
+
+The chart ships with safe defaults that allow offline templating (required for `oc-mirror` image discovery). However, these defaults point to placeholder hostnames and may not match your cluster. For a working deployment, you must override the cluster-specific values listed below.
+
+When using `install-helm-chart.sh`, these values are **auto-detected** and passed via `--set`. When installing directly with `helm install`, you must provide them yourself.
+
+### Values Reference
+
+| Value | Chart Default | Required? | Description |
+|-------|---------------|-----------|-------------|
+| `global.clusterDomain` | `apps.cluster.local` | Yes (OpenShift) | Wildcard domain for Route hostnames. Routes will not resolve without the real domain. |
+| `global.storageClass` | `ocs-storagecluster-ceph-rbd` | Recommended | Default StorageClass for all PVCs. Override if your cluster uses a different default. |
+| `global.volumeMode` | `Filesystem` | No | PVC volume mode. Change only if using raw block storage. |
+| `objectStorage.endpoint` | `s3.openshift-storage.svc.cluster.local` | Yes | S3-compatible endpoint hostname. Must point to your actual S3 provider. |
+| `objectStorage.port` | `443` | No | S3 endpoint port. |
+| `objectStorage.useSSL` | `true` | No | Use TLS for S3 connections. Set `false` for S3 or other HTTP-only backends. |
+| `objectStorage.secretName` | `""` | Yes (direct install) | Name of a pre-created `Secret` containing `access-key` and `secret-key`. |
+| `valkey.securityContext.fsGroup` | *(unset)* | Yes (OpenShift) | GID for Valkey PVC file ownership. Without this, Valkey pods fail with PVC permission errors. |
+| `jwtAuth.keycloak.installed` | `true` | No | Set `false` if Keycloak is not deployed. |
+| `jwtAuth.keycloak.url` | `""` | Recommended | Keycloak external URL. Defaults to internal cluster URL `https://keycloak-service.keycloak.svc.cluster.local:8080` when empty. |
+| `jwtAuth.keycloak.namespace` | `""` | No | Keycloak namespace. Defaults to `keycloak` when empty. |
+
+### How to Detect Values
+
+```bash
+# Cluster domain
+oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}'
+
+# Default storage class
+kubectl get sc  # Look for the (default) annotation
+
+# Valkey fsGroup (from namespace supplemental-groups annotation)
+oc get ns cost-onprem -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}'
+# Returns "1000740000/10000" — use the first number: 1000740000
+
+# Keycloak URL
+oc get route keycloak -n keycloak -o jsonpath='{.spec.host}'
+# Prepend https:// to get the full URL
+```
+
+### Why Defaults Exist
+
+The chart must template successfully with zero `--set` flags so that `oc-mirror` can discover all container images for disconnected mirroring. The defaults produce valid YAML but point to placeholder hostnames (e.g., `apps.cluster.local`). The install script — or your own automation — must override these with real values before deployment.
 
 ---
 
@@ -491,12 +603,12 @@ helm install cost-onprem ./cost-onprem -f values-production.yaml
 ### OpenShift Configuration
 
 ```yaml
-# Use ODF
-odf:
-  endpoint: "s3.openshift-storage.svc.cluster.local"
-  bucket: "ros-data"
-  credentials:
-    secretName: "cost-onprem-odf-credentials"
+# S3-compatible object storage (see Storage Configuration section for full options)
+objectStorage:
+  endpoint: ""  # Auto-detected by install script, or set manually
+  port: 443
+  useSSL: true
+  secretName: ""  # Set to use a pre-existing credentials secret
 
 # OpenShift Routes
 gatewayRoute:
@@ -512,6 +624,281 @@ global:
 ```
 
 **See [Platform Guide](platform-guide.md) for detailed platform configuration**
+
+---
+
+## External Infrastructure (BYOI)
+
+The chart bundles PostgreSQL, Valkey, and deploys Kafka via AMQ Streams for development and testing. For production deployments, you can **bring your own infrastructure** (BYOI) by connecting to externally-managed services instead.
+
+| Service | Bundled Default | External Examples | Config Key |
+|---------|----------------|-------------------|------------|
+| **PostgreSQL** | Single-replica StatefulSet | RDS, Crunchy, EDB, Azure DB | `database.deploy: false` |
+| **Valkey/Redis** | Single-replica Deployment | ElastiCache, Redis Enterprise, Azure Cache | `valkey.deploy: false` |
+| **Kafka** | AMQ Streams (via install script) | MSK, Confluent, other Kafka providers | `kafka.bootstrapServers` |
+| **Keycloak** | RHBK (via deploy-rhbk.sh) | Customer-managed Keycloak | `jwtAuth.keycloak.url` |
+
+---
+
+### External PostgreSQL
+
+Use an existing enterprise PostgreSQL instance instead of the bundled StatefulSet.
+
+**Prerequisites:**
+
+1. A PostgreSQL 16+ server accessible from the OpenShift cluster
+2. Three databases created on the server:
+
+| Database | Default Name | Purpose |
+|----------|-------------|---------|
+| ROS | `costonprem_ros` | Resource Optimization Service |
+| Kruize | `costonprem_kruize` | Kruize optimization engine |
+| Koku | `costonprem_koku` | Cost Management (Koku) |
+
+3. Three dedicated users with ownership of their respective databases:
+
+```sql
+-- Create users
+CREATE USER ros_user WITH PASSWORD '<ros_password>';
+CREATE USER kruize_user WITH PASSWORD '<kruize_password>';
+CREATE USER koku_user WITH PASSWORD '<koku_password>';
+
+-- Create databases with owners
+CREATE DATABASE costonprem_ros OWNER ros_user;
+CREATE DATABASE costonprem_kruize OWNER kruize_user;
+CREATE DATABASE costonprem_koku OWNER koku_user;
+
+-- Grant privileges
+GRANT ALL PRIVILEGES ON DATABASE costonprem_ros TO ros_user;
+GRANT ALL PRIVILEGES ON DATABASE costonprem_kruize TO kruize_user;
+GRANT ALL PRIVILEGES ON DATABASE costonprem_koku TO koku_user;
+
+-- Koku requires CREATEDB and CREATEROLE for migrations
+-- CREATEDB: needed for Koku migration 0039 (creates 'hive' database)
+-- CREATEROLE: needed for Koku migration that creates 'hive' role
+ALTER USER koku_user CREATEDB CREATEROLE;
+```
+
+> **Note:** Koku Django migrations will automatically create a `hive` role and `hive` database (used for Trino/Hive integration in SaaS, unused in on-prem mode). This requires `koku_user` to have `CREATEDB` and `CREATEROLE` privileges as shown above. No manual creation of the `hive` database is needed. This requirement will be removed once [project-koku/koku#5900](https://github.com/project-koku/koku/pull/5900) lands in a new Koku image (tracked in PR #96).
+
+4. A Kubernetes Secret with all credentials:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-external-db-credentials
+type: Opaque
+stringData:
+  postgres-user: "admin"
+  postgres-password: "<admin_password>"
+  ros-user: "ros_user"
+  ros-password: "<ros_password>"
+  kruize-user: "kruize_user"
+  kruize-password: "<kruize_password>"
+  koku-user: "koku_user"
+  koku-password: "<koku_password>"
+```
+
+**Configuration:**
+
+```yaml
+# values.yaml
+database:
+  deploy: false
+  server:
+    host: "my-postgres.example.com"
+    port: 5432
+    sslMode: require  # or verify-full for production
+  secretName: "my-external-db-credentials"
+  ros:
+    name: costonprem_ros
+  kruize:
+    name: costonprem_kruize
+  koku:
+    name: costonprem_koku
+```
+
+When `database.deploy: false`:
+- The chart skips the PostgreSQL StatefulSet, Service, and init ConfigMap
+- The install script skips database credential creation
+- Init containers (`waitForDb`) target the external host instead of the internal service
+- All application components connect to the external database via the configured host
+
+> **Testing note (BYOI):** The E2E test suite discovers the external database pod by reading
+> the resolved hostname from application pod environment variables, then resolving the backing
+> pod via Kubernetes service endpoints. If the external database runs in a different namespace,
+> the test runner (user or CI service account) needs `pods/exec` permission in that namespace.
+> On OpenShift, grant the service account `edit` (or a custom role with `pods/exec`) in the
+> external database namespace.
+
+See [docs/examples/byoi-values.yaml](../examples/byoi-values.yaml) for a complete BYOI values overlay example.
+
+---
+
+### External Valkey/Redis
+
+Use an existing Redis-compatible cache instead of the bundled Valkey Deployment.
+
+**Prerequisites:**
+
+1. A Redis 7+ or Valkey 8+ instance accessible from the OpenShift cluster
+2. (Optional) Authentication credentials if the instance is password-protected
+
+**Configuration:**
+
+```yaml
+# values.yaml
+valkey:
+  deploy: false
+  host: "my-redis.example.com"
+  port: 6379
+  auth:
+    enabled: true
+    secretName: "my-redis-credentials"  # Secret with key: redis-password
+```
+
+When `valkey.deploy: false`:
+- The chart skips the Valkey Deployment, Service, and PVC
+- Koku and Celery components connect to the external Redis host
+- If `auth.enabled`, a `REDIS_PASSWORD` environment variable is injected into all consumers (requires `auth.secretName`)
+
+**Consumers:** Koku API, MASU, Kafka Listener, Migration Job, Celery Beat, and all Celery Workers. ROS components do not use Valkey.
+
+---
+
+### Kafka Infrastructure Requirements
+
+Cost Management On-Premise uses Apache Kafka for its data pipeline. Kafka can be deployed automatically by the bundled `deploy-kafka.sh` script (via AMQ Streams) or managed externally by the cluster administrator.
+
+#### What the bundled deployment provides
+
+When you run `./scripts/deploy-kafka.sh`, the script installs AMQ Streams (Streams for Apache Kafka) 3.1 via OLM and creates a KRaft-based Kafka cluster with the following characteristics:
+
+| Property | Development (`dev`) | Production (`ocp`) |
+|----------|--------------------|--------------------|
+| Kafka version | 4.1.0 | 4.1.0 |
+| Cluster mode | KRaft (no ZooKeeper) | KRaft (no ZooKeeper) |
+| Broker nodes | 1 | 3 |
+| Controller nodes | 1 | 3 |
+| Broker storage | 10 Gi persistent (JBOD) | 100 Gi persistent (JBOD) |
+| Controller storage | 5 Gi persistent (JBOD) | 20 Gi persistent (JBOD) |
+| Listeners | PLAINTEXT (9092) | PLAINTEXT (9092) + TLS (9093) |
+| Replication factor | 1 | 3 |
+| Min in-sync replicas | 1 | 2 |
+| Log retention | 7 days | 7 days |
+
+#### Required Kafka topics
+
+The following topics must exist before the application starts processing data. The bundled script creates them automatically. If you manage Kafka externally, create them manually or enable `auto.create.topics.enable`.
+
+| Topic | Partitions | Purpose | Producers | Consumers |
+|-------|------------|---------|-----------|-----------|
+| `platform.upload.announce` | 3 | Upload announcements for cost reports | Ingress | Koku Listener |
+| `platform.payload-status` | 3 | Payload processing status tracking | Ingress | Koku Listener |
+| `hccm.ros.events` | 3 | Resource optimization events | Koku (MASU) | ROS Processor |
+| `platform.sources.event-stream` | 3 | Source configuration events | Sources API | Koku Listener |
+| `rosocp.kruize.recommendations` | 3 | Kruize optimization recommendations | Kruize | ROS Recommendation Poller |
+
+**Recommended topic settings:**
+- **Replication factor**: Match your broker count (3 for production)
+- **Retention**: At least 7 days (`retention.ms: 604800000`)
+- **Segment rotation**: 1 day (`segment.ms: 86400000`)
+
+#### Kafka connection settings
+
+The Helm chart does **not** deploy Kafka — it only configures applications to connect to it. Connection settings are in `values.yaml`:
+
+```yaml
+kafka:
+  bootstrapServers: "cost-onprem-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092"
+  securityProtocol: "PLAINTEXT"
+```
+
+The `install-helm-chart.sh` script auto-detects the bootstrap address from the deployed Kafka cluster. To override (e.g., for an external cluster):
+
+```bash
+KAFKA_BOOTSTRAP_SERVERS="my-kafka-broker1:9092" ./scripts/install-helm-chart.sh
+```
+
+Or set it in your values file directly.
+
+#### External Kafka
+
+Use an existing Kafka cluster instead of the bundled AMQ Streams deployment.
+
+> **Known Limitation:** Only **PLAINTEXT** Kafka connections are currently supported. Both Koku and ROS backends do not read SASL/TLS configuration from environment variables in on-prem (non-Clowder) mode. Upstream application changes are required before chart-level SASL/TLS support can be added.
+
+**Prerequisites:**
+
+1. Apache Kafka 3.x or later accessible from the OpenShift cluster with a **PLAINTEXT** listener
+2. All five topics listed above must exist (or `auto.create.topics.enable` must be set to `true`)
+3. Bootstrap servers reachable from the `cost-onprem` namespace over the network
+
+**Configuration:**
+
+```yaml
+# values.yaml
+kafka:
+  bootstrapServers: "my-kafka-broker1:9092,my-kafka-broker2:9092"
+  securityProtocol: "PLAINTEXT"
+```
+
+**Install script behavior:** Setting `KAFKA_BOOTSTRAP_SERVERS` tells the install script to skip AMQ Streams operator verification:
+
+```bash
+KAFKA_BOOTSTRAP_SERVERS="my-kafka-broker1:9092" ./scripts/install-helm-chart.sh --namespace cost-onprem
+```
+
+**Components that use Kafka:**
+
+| Component | Role | Topics used |
+|-----------|------|-------------|
+| Ingress | Producer | `platform.upload.announce`, `platform.payload-status` |
+| Koku Listener | Consumer | `platform.upload.announce`, `platform.payload-status`, `platform.sources.event-stream` |
+| Koku (MASU) | Producer | `hccm.ros.events` |
+| ROS Processor | Consumer | `hccm.ros.events` |
+| ROS Recommendation Poller | Consumer | `rosocp.kruize.recommendations` |
+| ROS Housekeeper | Consumer | `hccm.ros.events` |
+| ROS API | Consumer | (reads consumer group offsets) |
+| Kruize | Producer | `rosocp.kruize.recommendations` |
+
+---
+
+### External Keycloak
+
+Use a customer-managed Keycloak instance instead of the RHBK deployed by `deploy-rhbk.sh`.
+
+**Prerequisites:**
+
+1. Keycloak 22+ accessible from the OpenShift cluster
+2. A realm (default: `kubernetes`) with two clients configured:
+
+| Client ID | Type | Purpose |
+|-----------|------|---------|
+| `cost-management-operator` | Service account (client_credentials) | Cost Management Metrics Operator |
+| `cost-management-ui` | OAuth2 (authorization_code) | UI authentication via oauth2-proxy |
+
+3. Both clients must include `cost-management-operator` and `cost-management-ui` in their `aud` claim (audience mappers)
+4. Client secrets must be available as Kubernetes Secrets in the Keycloak namespace
+
+**Configuration:**
+
+```yaml
+# values.yaml
+jwtAuth:
+  keycloak:
+    url: "https://keycloak.example.com"
+    namespace: "my-keycloak-namespace"
+    realm: kubernetes
+    client:
+      id: cost-management-operator
+    audiences:
+      - cost-management-operator
+      - cost-management-ui
+```
+
+For detailed setup including realm import and client configuration, see the [External Keycloak Scenario](../architecture/external-keycloak-scenario.md) guide.
 
 ---
 
@@ -641,6 +1028,9 @@ kruize:
 ```bash
 # Test configuration rendering
 helm template cost-onprem ./cost-onprem --values my-values.yaml | kubectl apply --dry-run=client -f -
+
+# Test BYOI configuration rendering (external database + cache)
+helm template cost-onprem ./cost-onprem --values docs/examples/byoi-values.yaml | kubectl apply --dry-run=client -f -
 
 # Check computed values
 helm get values cost-onprem -n cost-onprem

@@ -1,11 +1,11 @@
-# Cost Management Operator Upload Verification Checklist
+# Cost Management Metrics Operator Upload Verification Checklist
 
 This checklist ensures 100% confidence that the Cost Management Metrics Operator is successfully uploading payloads and that they are being processed through the entire ROS pipeline.
 
 ## Prerequisites
 
 - Namespace with `cost_management_optimizations=true` label exists
-- Cost Management Operator is deployed and configured
+- Cost Management Metrics Operator is deployed and configured
 - ROS components (ingress, processor, Kruize) are running
 
 ---
@@ -83,7 +83,7 @@ oc logs -n cost-onprem $INGRESS_POD -c ingress --tail=200 | grep -E "upload|ros|
 **Expected Results:**
 - ✅ Log line: `POST /api/ingress/v1/upload` with 202 status
 - ✅ Files extracted successfully
-- ✅ Files uploaded to storage (S3/MinIO/ODF)
+- ✅ Files uploaded to storage (S3/ODF)
 
 **If Failed:** Check ingress logs for errors, JWT authentication issues, or storage problems.
 
@@ -265,7 +265,7 @@ echo -e "\n=== Verification Complete ==="
 ### Issue: Ingress rejecting payload
 - Check JWT authentication (401 errors)
 - Verify X-Rh-Identity header present (with Envoy)
-- Check storage (S3/MinIO/ODF) is accessible
+- Check storage (S3/ODF) is accessible
 - Review ingress logs for specific error messages
 
 ### Issue: Processor not processing
@@ -292,5 +292,5 @@ echo -e "\n=== Verification Complete ==="
 
 - `scripts/query-kruize.sh` - Query Kruize database for experiments and recommendations
 - `scripts/install-helm-chart.sh` - Deploy/upgrade ROS Helm chart
-- `scripts/setup-cost-mgmt-tls.sh` - Configure Cost Management Operator
+- `scripts/setup-cost-mgmt-tls.sh` - Configure Cost Management Metrics Operator
 

@@ -5,6 +5,8 @@ Complete installation methods, prerequisites, and upgrade procedures for the Cos
 ## Table of Contents
 - [Prerequisites](#prerequisites)
 - [Installation Methods](#installation-methods)
+  - [Method 1: Script-Based Installation (Recommended)](#method-1-script-based-installation-recommended)
+  - [Method 2: Direct Helm Installation](#method-2-direct-helm-installation)
 - [OpenShift Prerequisites](#openshift-prerequisites)
 - [Upgrade Procedures](#upgrade-procedures)
 - [Verification](#verification)
@@ -20,10 +22,9 @@ The installation scripts require the following tools:
 
 ```bash
 # Required
-curl    # For downloading releases from GitHub
-jq      # For parsing JSON responses
 helm    # For installing Helm charts (v3+)
 kubectl # For Kubernetes cluster access
+jq      # For JSON processing
 
 # Required for E2E Testing
 python3      # Python 3 interpreter (for NISE data generation)
@@ -35,13 +36,13 @@ python3-venv # Virtual environment module (for NISE isolation)
 ```bash
 # Ubuntu/Debian
 sudo apt-get update
-sudo apt-get install curl jq python3 python3-venv
+sudo apt-get install jq python3 python3-venv
 
 # RHEL/CentOS/Fedora
-sudo dnf install curl jq python3 python3-venv
+sudo dnf install jq python3 python3-venv
 
 # macOS
-brew install curl jq
+brew install jq
 
 # Install Helm (all platforms)
 curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
@@ -58,9 +59,9 @@ Ensure you have:
 
 ## Installation Methods
 
-### Method 1: Automated Installation (Recommended)
+### Method 1: Script-Based Installation (Recommended)
 
-The easiest way to install using the automation script:
+The easiest way to install using the automation script. Best for most users, CI/CD pipelines, and quick deployments.
 
 ```bash
 # Install latest release with default settings
@@ -88,7 +89,7 @@ The script deploys a unified chart containing all components:
 - Valkey (caching and Celery broker)
 
 **Applications:**
-- Koku API (reads, writes, masu, listener)
+- Koku API (unified, masu, listener)
 - Celery Workers (background processing)
 - ROS components (API, processor, housekeeper)
 - Sources API
@@ -97,122 +98,356 @@ The script deploys a unified chart containing all components:
 **Features:**
 - ✅ Two-phase deployment (infrastructure first, then application)
 - ✅ Automatic secret creation (Django, Sources, S3 credentials)
-- ✅ Auto-discovers ODF S3 credentials
+- ✅ Installs from the Helm chart repository (GitHub Pages)
+- ✅ Auto-discovers S3 credentials (OBC, NooBaa, S4)
 - ✅ OpenShift platform verification
 - ✅ Automatic upgrade detection
 - ✅ Perfect for CI/CD pipelines
-- ✅ Automatic fallback to local chart if GitHub unavailable
+- ✅ Version pinning support via `CHART_VERSION`
 
 **Environment Variables:**
 - `HELM_RELEASE_NAME`: Helm release name (default: `cost-onprem`)
 - `NAMESPACE`: Target namespace (default: `cost-onprem`)
 - `VALUES_FILE`: Path to custom values file
-- `USE_LOCAL_CHART`: Use local chart instead of GitHub release (default: `false`)
+- `CHART_VERSION`: Pin a specific chart version (default: latest)
+- `USE_LOCAL_CHART`: Use local chart instead of Helm repository (default: `false`)
 - `LOCAL_CHART_PATH`: Path to local chart directory (default: `../cost-onprem`)
 
 **Note**: JWT authentication is automatically enabled on OpenShift.
 
+> **BYOI (Bring Your Own Infrastructure):** When `database.deploy: false` is set in your values file, the script skips PostgreSQL credential creation and expects you to have pre-created the database credentials secret. See [External Infrastructure (BYOI)](configuration.md#external-infrastructure-byoi) for details.
 ---
 
-### Method 2: GitHub Release Installation
+### Method 2: Direct Helm Installation
 
-For CI/CD systems that prefer direct control:
+For administrators who prefer full control over the deployment or cannot use the `install-helm-chart.sh` script (e.g., GitOps/ArgoCD workflows, air-gapped environments, custom CI pipelines), you can install the chart directly with `helm install`. You must supply the cluster-specific values that the install script would normally auto-detect.
 
+#### Chart Source Options
+
+| Source | Use Case | Installation |
+|--------|----------|--------------|
+| Helm Repository | Production (recommended) | `helm repo add cost-onprem https://insights-onprem.github.io/cost-onprem-chart` |
+| OCI Registry | Air-gapped, GitOps, oc-mirror | `helm pull oci://ghcr.io/insights-onprem/cost-onprem-chart/cost-onprem` |
+| Local Source | Development, testing, modifications | Clone repo and use `./cost-onprem` directory |
+
+**Helm Repository (recommended):**
 ```bash
-# Get latest release URL dynamically
-LATEST_URL=$(curl -s https://api.github.com/repos/insights-onprem/cost-onprem-chart/releases/latest | \
-  jq -r '.assets[] | select(.name | endswith(".tgz")) | .browser_download_url')
-
-# Download and install
-curl -L -o cost-onprem-latest.tgz "$LATEST_URL"
-helm install cost-onprem cost-onprem-latest.tgz \
-  --namespace cost-onprem \
-  --create-namespace
-
-# Verify installation
-helm status cost-onprem -n cost-onprem
-```
-
-**With custom values:**
-```bash
-helm install cost-onprem cost-onprem-latest.tgz \
-  --namespace cost-onprem \
-  --create-namespace \
-  --values my-values.yaml
-```
-
----
-
-### Method 3: Helm Repository (Future)
-
-```bash
-# Add Helm repository (once published)
+# Add Helm repository
 helm repo add cost-onprem https://insights-onprem.github.io/cost-onprem-chart
 helm repo update
 
-# Install from repository
+# Install latest version
 helm install cost-onprem cost-onprem/cost-onprem \
   --namespace cost-onprem \
   --create-namespace
+
+# Install a specific version
+helm install cost-onprem cost-onprem/cost-onprem \
+  --namespace cost-onprem \
+  --create-namespace \
+  --version 0.2.9
 ```
 
----
+**Verify available versions:**
+```bash
+helm search repo cost-onprem
+```
 
-### Method 4: Local Source Installation
+**OCI Registry (air-gapped/GitOps):**
 
-For development, testing, or custom modifications:
+The chart is also published as an OCI artifact to GitHub Container Registry. This is useful for:
+- Air-gapped environments using `oc-mirror`
+- GitOps workflows (ArgoCD, Flux) that prefer OCI references
+- Environments where traditional Helm repositories are blocked
 
+```bash
+# Install latest version from OCI registry
+helm install cost-onprem oci://ghcr.io/insights-onprem/cost-onprem-chart/cost-onprem \
+  --namespace cost-onprem \
+  --create-namespace
+
+# Install a specific version
+helm install cost-onprem oci://ghcr.io/insights-onprem/cost-onprem-chart/cost-onprem \
+  --namespace cost-onprem \
+  --create-namespace \
+  --version 0.2.9
+
+# Pull chart locally (for inspection or mirroring)
+helm pull oci://ghcr.io/insights-onprem/cost-onprem-chart/cost-onprem --version 0.2.9
+
+# Show available versions
+helm show all oci://ghcr.io/insights-onprem/cost-onprem-chart/cost-onprem
+```
+
+> **Note:** OCI-based installation does not require `helm repo add`. The chart is fetched directly from the container registry.
+
+**Local Source (for development):**
 ```bash
 # Clone the repository
 git clone https://github.com/insights-onprem/cost-onprem-chart.git
 cd cost-onprem-chart
 
-# Method A: Using installation script
-export USE_LOCAL_CHART=true
-./scripts/install-helm-chart.sh
+# Use ./cost-onprem in the helm install commands below
+```
 
-# Method B: Direct Helm installation
-helm install cost-onprem ./cost-onprem \
-  --namespace cost-onprem \
-  --create-namespace
+#### Step 1: Gather Cluster-Specific Values
 
-# With custom values
+The chart ships with safe defaults for offline templating (used by `oc-mirror`), but real deployments require actual cluster values. Gather these from your cluster:
+
+```bash
+# Cluster domain (for Route hostnames)
+CLUSTER_DOMAIN=$(oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+
+# Default storage class
+STORAGE_CLASS=$(kubectl get sc -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' | awk '{print $1}')
+
+# Valkey fsGroup (from namespace supplemental-groups)
+# First, create the namespace if it doesn't exist
+oc create namespace cost-onprem --dry-run=client -o yaml | oc apply -f -
+SUPP_GROUPS=$(oc get ns cost-onprem -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}')
+FS_GROUP=$(echo "$SUPP_GROUPS" | cut -d'/' -f1)
+
+# Keycloak URL (if using RHBK)
+KEYCLOAK_NAMESPACE=$(oc get keycloaks.k8s.keycloak.org -A -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null)
+KEYCLOAK_HOST=$(oc get keycloaks.k8s.keycloak.org -A -o jsonpath='{.items[0].status.hostname}' 2>/dev/null)
+KEYCLOAK_URL="https://${KEYCLOAK_HOST}"
+```
+
+#### Step 2: Prepare S3 Storage
+
+Create a credentials secret and note your S3 endpoint:
+
+```bash
+kubectl create secret generic my-s3-credentials \
+  --namespace=cost-onprem \
+  --from-literal=access-key="<YOUR_ACCESS_KEY>" \
+  --from-literal=secret-key="<YOUR_SECRET_KEY>"
+```
+
+#### Step 3: Install with `--set` Flags
+
+```bash
 helm install cost-onprem ./cost-onprem \
   --namespace cost-onprem \
   --create-namespace \
-  --values custom-values.yaml
+  -f openshift-values.yaml \
+  --set global.clusterDomain="$CLUSTER_DOMAIN" \
+  --set global.storageClass="$STORAGE_CLASS" \
+  --set valkey.securityContext.fsGroup="$FS_GROUP" \
+  --set objectStorage.endpoint="<YOUR_S3_ENDPOINT>" \
+  --set objectStorage.port=443 \
+  --set objectStorage.useSSL=true \
+  --set objectStorage.secretName="my-s3-credentials" \
+  --set jwtAuth.keycloak.installed=true \
+  --set jwtAuth.keycloak.namespace="$KEYCLOAK_NAMESPACE" \
+  --set jwtAuth.keycloak.url="$KEYCLOAK_URL" \
+  --wait
+```
+
+#### Complete Values Reference (Direct Install)
+
+The table below lists every cluster-specific value, its chart default, and how to determine the correct value for your environment.
+
+| Value | Chart Default | Description | How to Determine |
+|-------|---------------|-------------|------------------|
+| `global.clusterDomain` | `apps.cluster.local` | OpenShift wildcard domain for Routes | `oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}'` |
+| `global.storageClass` | `ocs-storagecluster-ceph-rbd` | Default StorageClass for PVCs | `kubectl get sc` (look for the `(default)` annotation) |
+| `global.volumeMode` | `Filesystem` | PVC volume mode | Usually `Filesystem`; change only for raw block storage |
+| `objectStorage.endpoint` | `s3.openshift-storage.svc.cluster.local` | S3-compatible endpoint hostname | Your S3 provider's endpoint (e.g., `s3.amazonaws.com`, S4 hostname) |
+| `objectStorage.port` | `443` | S3 endpoint port | `443` for HTTPS, `80` for HTTP |
+| `objectStorage.useSSL` | `true` | Use TLS for S3 connections | `true` for production, `false` for S4/dev |
+| `objectStorage.secretName` | `""` | Pre-created credentials secret name | Name of the `Secret` you created in Step 2 |
+| `valkey.securityContext.fsGroup` | *(unset)* | GID for Valkey PVC access on OpenShift | `oc get ns <NS> -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}'` (first number) |
+| `jwtAuth.keycloak.installed` | `true` | Whether Keycloak is deployed | `true` if RHBK is installed, `false` otherwise |
+| `jwtAuth.keycloak.url` | `""` | Keycloak external URL | `oc get route keycloak -n keycloak -o jsonpath='https://{.spec.host}'` |
+| `jwtAuth.keycloak.namespace` | `""` | Namespace where Keycloak runs | Usually `keycloak` |
+| `database.deploy` | `true` | Deploy bundled PostgreSQL StatefulSet | Set `false` to use an external database (see [BYOI](configuration.md#external-infrastructure-byoi)) |
+| `valkey.deploy` | `true` | Deploy bundled Valkey Deployment | Set `false` to use an external Redis/Valkey (see [BYOI](configuration.md#external-infrastructure-byoi)) |
+
+> **Important:** The chart defaults are designed for `oc-mirror` image discovery (offline templating). They produce syntactically valid manifests but point to placeholder hostnames. For a working deployment, you **must** override the values marked above with real cluster values.
+
+#### Step 4: Create Required Secrets
+
+The install script normally creates several secrets automatically. When installing directly, you must create them yourself:
+
+```bash
+# 1. Django secret key (required by Koku)
+kubectl create secret generic cost-onprem-django \
+  --namespace=cost-onprem \
+  --from-literal=django-secret-key="$(openssl rand -base64 50 | tr -dc 'a-zA-Z0-9' | head -c 50)"
+
+# 2. S3 credentials (if not already created in Step 2)
+# See Step 2 above
+
+# 3. Keycloak CA certificate (for TLS trust between oauth2-proxy and Keycloak)
+# Extract the Keycloak CA certificate and create the secret:
+oc get secret -n keycloak keycloak-tls -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/keycloak-ca.crt
+kubectl create secret generic keycloak-ca-cert \
+  --namespace=cost-onprem \
+  --from-file=ca.crt=/tmp/keycloak-ca.crt
+
+# 4. Database credentials (required — created by install script normally, or pre-created for BYOI)
+# When using database.deploy: false (external database), you must create this secret manually:
+kubectl create secret generic cost-onprem-db-credentials \
+  --namespace=cost-onprem \
+  --from-literal=postgres-user="admin" \
+  --from-literal=postgres-password="<admin_password>" \
+  --from-literal=ros-user="ros_user" \
+  --from-literal=ros-password="<ros_password>" \
+  --from-literal=kruize-user="kruize_user" \
+  --from-literal=kruize-password="<kruize_password>" \
+  --from-literal=koku-user="koku_user" \
+  --from-literal=koku-password="<koku_password>"
+```
+
+#### Step 5: Verify
+
+```bash
+# Check all pods are running
+kubectl get pods -n cost-onprem -l app.kubernetes.io/instance=cost-onprem
+
+# Check PVCs are bound
+kubectl get pvc -n cost-onprem
+
+# Check routes are created with correct hostnames
+oc get routes -n cost-onprem
+```
+
+#### Example: Minimal `my-values.yaml` for Direct Install
+
+Instead of passing many `--set` flags, you can create a values file:
+
+```yaml
+# my-values.yaml — cluster-specific overrides for direct helm install
+global:
+  clusterDomain: "apps.mycluster.example.com"
+  storageClass: "gp3-csi"
+
+objectStorage:
+  endpoint: "s3.us-east-1.amazonaws.com"
+  port: 443
+  useSSL: true
+  secretName: "my-s3-credentials"
+  s3:
+    region: "us-east-1"
+
+valkey:
+  securityContext:
+    fsGroup: 1000740000  # From namespace supplemental-groups annotation
+
+jwtAuth:
+  keycloak:
+    installed: true
+    url: "https://keycloak-keycloak.apps.mycluster.example.com"
+    namespace: "keycloak"
+```
+
+#### Example: BYOI `my-values.yaml` (External PostgreSQL + Valkey)
+
+For deployments using external infrastructure (see also [docs/examples/byoi-values.yaml](../examples/byoi-values.yaml) for a minimal overlay):
+
+```yaml
+# my-byoi-values.yaml — external database and cache
+global:
+  clusterDomain: "apps.mycluster.example.com"
+  storageClass: "gp3-csi"
+
+database:
+  deploy: false
+  server:
+    host: "my-postgres.example.com"
+    port: 5432
+    sslMode: require
+  secretName: "cost-onprem-db-credentials"
+
+valkey:
+  deploy: false
+  host: "my-redis.example.com"
+  port: 6379
+
+kafka:
+  bootstrapServers: "my-kafka:9092"
+  securityProtocol: "PLAINTEXT"
+
+objectStorage:
+  endpoint: "s3.us-east-1.amazonaws.com"
+  port: 443
+  useSSL: true
+  secretName: "my-s3-credentials"
+  s3:
+    region: "us-east-1"
+
+jwtAuth:
+  keycloak:
+    installed: true
+    url: "https://keycloak-keycloak.apps.mycluster.example.com"
+    namespace: "keycloak"
+```
+
+Then install:
+
+```bash
+helm install cost-onprem ./cost-onprem \
+  --namespace cost-onprem \
+  --create-namespace \
+  -f openshift-values.yaml \
+  -f my-values.yaml \
+  --wait
 ```
 
 ---
 
 ## OpenShift Prerequisites
 
-### 1. OpenShift Data Foundation (ODF)
+### 1. S3-Compatible Object Storage
 
-ODF must be installed and operational:
+The chart requires S3-compatible object storage. ODF is **not required** — any S3 provider works. For full configuration details, see the [Storage Configuration](configuration.md#storage-configuration) section.
+
+**Supported backends:**
+
+| Backend | Use Case | Auto-Detected |
+|---------|----------|---------------|
+| AWS S3 | Production (disconnected AWS) | No — configure in `values.yaml` |
+| Direct Ceph RGW (ODF) | Production (OpenShift with ODF) | Yes — via OBC |
+| S4 (Ceph RGW) | Development/Testing | Yes — via `S3_ENDPOINT` |
+| NooBaa (ODF) | Fallback only | Yes — not recommended |
+
+Choose your path:
+
+#### Path A: Manual S3 Configuration (AWS S3 or any provider)
+
+Pre-create buckets, create a credentials secret, and configure `values.yaml`:
 
 ```bash
-# Verify ODF installation
-oc get noobaa -n openshift-storage
-oc get storagecluster -n openshift-storage
+# 1. Create namespace
+kubectl create namespace cost-onprem
 
-# Check S3 service availability
-oc get route s3 -n openshift-storage
+# 2. Create credentials secret
+kubectl create secret generic my-s3-credentials \
+  --namespace=cost-onprem \
+  --from-literal=access-key=<YOUR_ACCESS_KEY> \
+  --from-literal=secret-key=<YOUR_SECRET_KEY>
 ```
 
-**ODF endpoints:**
-- Internal: `s3.openshift-storage.svc.cluster.local:443`
-- External: Check routes in `openshift-storage` namespace
+```yaml
+# 3. In your values.yaml:
+objectStorage:
+  endpoint: "s3.us-east-1.amazonaws.com"  # Your S3 endpoint
+  port: 443
+  useSSL: true
+  secretName: "my-s3-credentials"
+  s3:
+    region: "us-east-1"
+```
 
-**Storage Class Requirement:**
+The install script detects the pre-configured endpoint and skips all S3 auto-detection.
 
-⚠️ **Important**: Use **Direct Ceph RGW** (`ocs-storagecluster-ceph-rgw`) instead of NooBaa (`ocs-storagecluster-ceph-rbd`) for strong consistency. NooBaa has eventual consistency issues that can cause ROS processing failures with 403 errors.
+#### Path B: ODF with Direct Ceph RGW (OBC auto-detection)
+
+Create an ObjectBucketClaim and let the install script handle the rest:
 
 ```bash
-# Verify Ceph RGW StorageClass is available
-oc get storageclass ocs-storagecluster-ceph-rgw
-
-# Create ObjectBucketClaim (OBC) for Direct Ceph RGW (Recommended)
+# Create OBC for Direct Ceph RGW
 cat <<EOF | oc apply -f -
 apiVersion: objectbucket.io/v1alpha1
 kind: ObjectBucketClaim
@@ -224,141 +459,55 @@ spec:
   storageClassName: ocs-storagecluster-ceph-rgw
 EOF
 
-# Wait for OBC to provision
 oc wait --for=condition=Ready obc/ros-data-ceph -n cost-onprem --timeout=5m
 ```
 
-**Storage Class Selection:**
-- ✅ **Direct Ceph RGW**: `ocs-storagecluster-ceph-rgw` (recommended for ROS)
-- ⚠️ **NooBaa**: `ocs-storagecluster-ceph-rbd` (eventual consistency issues)
+The install script automatically detects the OBC, extracts configuration (endpoint, credentials, bucket name), and passes it to Helm. No `values.yaml` changes needed.
 
-**OBC Auto-Detection**: The installation script automatically detects ObjectBucketClaims, extracts configuration (bucket name, endpoint, credentials), and configures the Helm deployment. No manual credential management needed when using OBC.
+> **Note**: Use Direct Ceph RGW (`ocs-storagecluster-ceph-rgw`) over NooBaa (`ocs-storagecluster-ceph-rbd`). NooBaa's eventual consistency causes 403 errors when reading freshly uploaded files.
 
-### 2. ODF S3 Credentials Secret (Alternative to OBC)
-
-Create credentials secret in deployment namespace:
+#### Path C: S4 (development/testing only)
 
 ```bash
-# Create secret with ODF S3 credentials
-kubectl create secret generic cost-onprem-odf-credentials \
+# Deploy S4
+./scripts/deploy-s4-test.sh cost-onprem
+
+# Install with S4
+S3_ENDPOINT=s4.cost-onprem.svc.cluster.local S3_PORT=7480 S3_USE_SSL=false \
+  ./scripts/install-helm-chart.sh --namespace cost-onprem
+```
+
+The script creates credentials, buckets, and passes `objectStorage.*` values to Helm.
+
+See [S4 Development Setup Guide](../development/ocp-dev-setup-s4.md) for details.
+
+### 2. Credentials and Secret Management
+
+**Security Best Practices:**
+- Use dedicated service accounts (not admin credentials)
+- Rotate credentials regularly
+- Use external secret management (Vault, Sealed Secrets) where possible
+- Use least-privilege access (specific buckets only)
+- Never commit credentials to version control
+
+**External Secret Management Example:**
+
+```bash
+# Sealed Secrets
+kubectl create secret generic my-s3-credentials \
   --namespace=cost-onprem \
-  --from-literal=access-key=<your-access-key> \
-  --from-literal=secret-key=<your-secret-key>
-
-# Verify secret
-kubectl get secret cost-onprem-odf-credentials -n cost-onprem
-```
-
-### Getting ODF Credentials
-
-#### Method 1: OpenShift Console (Recommended)
-
-1. Navigate to **Storage** → **Object Storage**
-2. Create or select bucket (e.g., `ros-data`)
-3. Go to **Access Keys** tab
-4. Click **Create Access Key**
-5. **Important**: Copy both keys immediately (secret key shown only once)
-
-#### Method 2: NooBaa CLI
-
-```bash
-# Install NooBaa CLI
-curl -LO https://github.com/noobaa/noobaa-operator/releases/download/v5.13.0/noobaa-linux
-chmod +x noobaa-linux
-sudo mv noobaa-linux /usr/local/bin/noobaa
-
-# Create account and bucket
-noobaa account create ros-account -n openshift-storage
-noobaa bucket create ros-data -n openshift-storage
-noobaa account attach ros-account --bucket ros-data -n openshift-storage
-
-# Get credentials
-noobaa account show ros-account -n openshift-storage
-```
-
-#### Method 3: Using Admin Credentials (Not Recommended)
-
-```bash
-# Get admin credentials from noobaa-admin secret
-kubectl get secret noobaa-admin -n openshift-storage \
-  -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d
-
-kubectl get secret noobaa-admin -n openshift-storage \
-  -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d
-
-# ⚠️ Warning: These are admin credentials with full access
-```
-
-#### Method 4: External Secret Management
-
-```bash
-# Example with Vault
-vault kv get -field=access_key secret/odf/ros-credentials
-vault kv get -field=secret_key secret/odf/ros-credentials
-
-# Example with Sealed Secrets
-kubectl create secret generic cost-onprem-odf-credentials \
   --from-literal=access-key=<key> \
   --from-literal=secret-key=<secret> \
   --dry-run=client -o yaml | \
   kubeseal -o yaml > sealed-secret.yaml
 ```
 
-**Security Best Practices:**
-- ✅ Use dedicated service accounts (not admin credentials)
-- ✅ Rotate credentials regularly
-- ✅ Store in external secret management (Vault, Sealed Secrets)
-- ✅ Use least-privilege access (specific buckets only)
-- ❌ Never commit credentials to version control
-
-### 3. Using MinIO Instead of ODF (Development/Testing Only)
-
-For development and testing on OCP clusters without ODF, you can use a standalone
-MinIO instance. This avoids the resource overhead of ODF (which requires 3+ nodes,
-30GB+ block devices, and the ODF operator).
-
-> **Warning**: MinIO is not supported for production deployments. Use ODF for
-> production environments.
-
-**Step 1: Deploy MinIO**
-
-```bash
-# Deploy MinIO into the cost-onprem namespace
-./scripts/deploy-minio-test.sh cost-onprem
-```
-
-This creates:
-- A MinIO Deployment (single replica, 512Mi memory)
-- A Service on port 80 (forwarding to MinIO's container port 9000)
-- A `minio-credentials` secret with access/secret keys
-- A PersistentVolumeClaim (10Gi, uses default StorageClass)
-
-**Step 2: Install the chart with `MINIO_ENDPOINT`**
-
-```bash
-MINIO_ENDPOINT=http://minio.cost-onprem.svc.cluster.local \
-  ./scripts/install-helm-chart.sh
-```
-
-The install script automatically:
-- Detects the `minio-credentials` secret and creates `cost-onprem-storage-credentials`
-- Sets `odf.endpoint`, `odf.port=80`, and `odf.useSSL=false` for the Helm chart
-- Creates the required S3 buckets via `mc`
-
-**MinIO Resource Requirements:**
-
-| Resource | Request | Limit |
-|----------|---------|-------|
-| CPU | 250m | 500m |
-| Memory | 512Mi | 1Gi |
-| Storage | 10Gi PVC | - |
-
-### 4. Namespace Permissions
+### 3. Namespace Permissions
 
 Ensure you have permissions to:
 - Create secrets in target namespace
 - Deploy Helm charts
-- Access ODF resources (or MinIO for dev)
+- Access S3 storage resources
 - Create routes (OpenShift)
 
 ```bash
@@ -371,25 +520,26 @@ oc auth can-i create routes -n cost-onprem
 ### 5. Resource Requirements
 
 **Single Node OpenShift (SNO):**
-- SNO cluster with ODF installed
-- 30GB+ block devices for ODF
+- SNO cluster with S3-compatible storage (ODF, S4, or external S3)
+- 30GB+ block devices for persistent volumes
 - Additional 6GB RAM for Cost Management On-Premise workloads
 - Additional 2 CPU cores
 
 **See [Configuration Guide](../operations/configuration.md) for detailed requirements**
 
-### 5. Kafka (Strimzi)
+### 5. Kafka (AMQ Streams)
 
 Kafka is required for the Cost Management data pipeline (OCP metrics ingestion).
 
 **Automated Deployment (Recommended):**
 ```bash
-# Deploy Strimzi operator and Kafka cluster
-./scripts/deploy-strimzi.sh
+# Deploy AMQ Streams operator and Kafka cluster (KRaft mode)
+./scripts/deploy-kafka.sh
 
 # Script will:
-# - Install Strimzi operator (version 0.45.1)
-# - Deploy Kafka cluster (version 3.8.0)
+# - Install AMQ Streams operator via OLM (channel: amq-streams-3.1.x)
+# - Deploy Kafka 4.1.0 cluster in KRaft mode (no ZooKeeper)
+# - Create separate controller and broker node pools with persistent JBOD storage
 # - Verify OpenShift platform
 # - Configure appropriate storage class
 # - Wait for cluster to be ready
@@ -398,22 +548,23 @@ Kafka is required for the Cost Management data pipeline (OCP metrics ingestion).
 **Customization:**
 ```bash
 # Custom namespace
-KAFKA_NAMESPACE=my-kafka ./scripts/deploy-strimzi.sh
+KAFKA_NAMESPACE=my-kafka ./scripts/deploy-kafka.sh
 
 # Custom Kafka cluster name
-KAFKA_CLUSTER_NAME=my-cluster ./scripts/deploy-strimzi.sh
+KAFKA_CLUSTER_NAME=my-cluster ./scripts/deploy-kafka.sh
 
 # For OpenShift with specific storage class
-STORAGE_CLASS=ocs-storagecluster-ceph-rbd ./scripts/deploy-strimzi.sh
+STORAGE_CLASS=ocs-storagecluster-ceph-rbd ./scripts/deploy-kafka.sh
 ```
 
 **Manual Verification:**
 ```bash
-# Check Strimzi operator
-oc get csv -A | grep strimzi
+# Check AMQ Streams operator
+oc get csv -A | grep amqstreams
 
-# Check Kafka cluster
+# Check Kafka cluster and node pools
 oc get kafka -n kafka
+oc get kafkanodepool -n kafka
 
 # Verify Kafka is ready
 oc wait kafka/cost-onprem-kafka --for=condition=Ready --timeout=300s -n kafka
@@ -421,6 +572,8 @@ oc wait kafka/cost-onprem-kafka --for=condition=Ready --timeout=300s -n kafka
 
 **Required Kafka Topics:**
 - `platform.upload.announce` (created automatically by Koku on first message)
+
+> **Using an existing Kafka cluster:** If you already have a Kafka cluster (e.g., AMQ Streams, Confluent, MSK), you can skip the AMQ Streams deployment and configure `kafka.bootstrapServers` in your values file. Set `KAFKA_BOOTSTRAP_SERVERS` when running the install script to skip AMQ Streams verification. Only PLAINTEXT connections are currently supported. See [External Kafka](configuration.md#external-kafka) for details.
 
 ### 6. User Workload Monitoring (Required for ROS Metrics)
 
@@ -472,24 +625,23 @@ oc get pods -n openshift-user-workload-monitoring -w
 ./scripts/install-helm-chart.sh
 
 # The script detects existing installations and performs upgrades
-# Uses GitHub releases by default
+# Installs from the Helm chart repository by default
 ```
 
 ### Manual Helm Upgrade
 
-#### From GitHub Release
+#### From Helm Repository
 
 ```bash
-# Get latest release
-LATEST_URL=$(curl -s https://api.github.com/repos/insights-onprem/cost-onprem-chart/releases/latest | \
-  jq -r '.assets[] | select(.name | endswith(".tgz")) | .browser_download_url')
+# Update repo index and upgrade to latest
+helm repo update cost-onprem
+helm upgrade cost-onprem cost-onprem/cost-onprem -n cost-onprem
 
-# Download and upgrade
-curl -L -o cost-onprem-latest.tgz "$LATEST_URL"
-helm upgrade cost-onprem cost-onprem-latest.tgz -n cost-onprem
+# Upgrade to a specific version
+helm upgrade cost-onprem cost-onprem/cost-onprem -n cost-onprem --version 0.2.9
 
 # With custom values
-helm upgrade cost-onprem cost-onprem-latest.tgz -n cost-onprem --values my-values.yaml
+helm upgrade cost-onprem cost-onprem/cost-onprem -n cost-onprem --values my-values.yaml
 ```
 
 #### From Local Source
@@ -582,9 +734,9 @@ kubectl exec -it deployment/cost-onprem-ros-api -n cost-onprem -- \
 kubectl exec -it statefulset/cost-onprem-kafka -n cost-onprem -- \
   kafka-topics.sh --list --bootstrap-server localhost:29092
 
-# Test ODF access
+# Test S3 access (endpoint depends on your storage backend)
 oc rsh -n cost-onprem deployment/cost-onprem-ingress -- \
-  aws s3 ls --endpoint-url https://s3.openshift-storage.svc.cluster.local
+  aws s3 ls --endpoint-url https://<your-s3-endpoint>
 ```
 
 ---
@@ -755,21 +907,11 @@ LIMIT 5;
 **Missing prerequisites:**
 ```bash
 # Check required tools
-which curl jq helm kubectl
+which jq helm kubectl
 
 # Install missing tools
-sudo apt-get install curl jq  # Ubuntu/Debian
-brew install curl jq           # macOS
-```
-
-**GitHub API rate limiting:**
-```bash
-# Check rate limit
-curl -s https://api.github.com/rate_limit
-
-# Use authentication token
-export GITHUB_TOKEN="your_personal_access_token"
-./scripts/install-helm-chart.sh
+sudo apt-get install jq        # Ubuntu/Debian
+brew install jq                # macOS
 ```
 
 **Script permissions:**
@@ -784,16 +926,13 @@ bash scripts/install-helm-chart.sh
 ### Network Issues
 
 ```bash
-# Test GitHub connectivity
-curl -s https://api.github.com/repos/insights-onprem/cost-onprem-chart/releases/latest
+# Test Helm repository connectivity
+helm repo add cost-onprem https://insights-onprem.github.io/cost-onprem-chart
+helm repo update cost-onprem
+helm search repo cost-onprem
 
-# Verbose debugging
-curl -v https://api.github.com/repos/insights-onprem/cost-onprem-chart/releases/latest
-
-# Manual download
-LATEST_URL=$(curl -s https://api.github.com/repos/insights-onprem/cost-onprem-chart/releases/latest | \
-  jq -r '.assets[] | select(.name | endswith(".tgz")) | .browser_download_url')
-curl -L -o cost-onprem-latest.tgz "$LATEST_URL"
+# If the repo add fails, verify the URL is reachable
+curl -sI https://insights-onprem.github.io/cost-onprem-chart/index.yaml
 ```
 
 ### Resource Issues

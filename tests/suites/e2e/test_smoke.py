@@ -36,14 +36,17 @@ def get_fresh_token(keycloak_config, http_session: requests.Session) -> dict:
 class TestE2ESmoke:
     """Quick smoke tests for E2E validation."""
 
-    def test_all_critical_pods_running(self, cluster_config):
+    def test_all_critical_pods_running(self, cluster_config, database_deployed):
         """Verify all critical pods are running."""
         critical_components = [
-            ("database", "app.kubernetes.io/component=database"),
             ("ingress", "app.kubernetes.io/component=ingress"),
             ("kruize", "app.kubernetes.io/component=ros-optimization"),
             ("ros-api", "app.kubernetes.io/component=ros-api"),
         ]
+        if database_deployed:
+            critical_components.insert(
+                0, ("database", "app.kubernetes.io/component=database")
+            )
         
         failures = []
         for name, label in critical_components:
@@ -65,23 +68,23 @@ class TestE2ESmoke:
         auth_header = get_fresh_token(keycloak_config, http_session)
         assert auth_header, "Could not obtain JWT token"
 
-    def test_ingress_accepts_authenticated_requests(
-        self, ingress_url: str, keycloak_config, http_session: requests.Session
+    def test_gateway_accepts_authenticated_requests(
+        self, gateway_url: str, keycloak_config, http_session: requests.Session
     ):
-        """Verify ingress accepts authenticated requests."""
+        """Verify gateway accepts authenticated requests."""
         auth_header = get_fresh_token(keycloak_config, http_session)
         if not auth_header:
             pytest.skip("Could not obtain fresh JWT token")
         
+        # Use cost-management status endpoint - always returns 200 with valid auth
         response = http_session.get(
-            f"{ingress_url}/ready",
+            f"{gateway_url}/cost-management/v1/status/",
             headers=auth_header,
             timeout=10,
         )
         
-        # Should not get 401/403
-        assert response.status_code not in [401, 403], (
-            f"Ingress rejected valid token: {response.status_code}"
+        assert response.status_code == 200, (
+            f"Expected 200 from status endpoint, got {response.status_code}"
         )
 
     def test_backend_api_accessible(
@@ -98,9 +101,9 @@ class TestE2ESmoke:
             timeout=10,
         )
 
-        # Accept 200 (success) or 404 (endpoint may not exist), but not 401/403
-        assert response.status_code not in [401, 403], (
-            f"Backend API rejected valid token: {response.status_code}"
+        # Koku status endpoint returns 200 with API version info
+        assert response.status_code == 200, (
+            f"Expected 200 from backend status, got {response.status_code}"
         )
 
     def test_kafka_cluster_healthy(self, cluster_config):

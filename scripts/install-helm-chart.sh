@@ -2,14 +2,23 @@
 
 # Cost Management On Premise Helm Chart Installation Script
 # This script deploys the Cost Management On Premise Helm chart to an OpenShift cluster
-# By default, it downloads and uses the latest release from GitHub
+# By default, it installs from the Helm chart repository (GitHub Pages)
 # Set USE_LOCAL_CHART=true to use local chart source instead
-# Requires: kubectl/oc configured with target cluster context, helm installed, curl, jq
+# Requires: kubectl/oc configured with target cluster context, helm installed, jq
 #
 # Environment Variables:
 #   LOG_LEVEL       - Control output verbosity (ERROR|WARN|INFO|DEBUG, default: WARN)
-#   USE_LOCAL_CHART - Use local chart instead of GitHub release (true|false, default: false)
+#   USE_LOCAL_CHART - Use local chart instead of Helm repository (true|false, default: false)
+#   CHART_VERSION   - Pin a specific chart version from the Helm repository (default: latest)
 #   NAMESPACE       - Target namespace (default: cost-onprem)
+#   S3_ENDPOINT     - S3 endpoint hostname for generic S3 backends (e.g., "s3.example.com")
+#   S3_PORT         - S3 port (default: 443, used with S3_ENDPOINT)
+#   S3_USE_SSL      - Whether S3 uses TLS (default: true, used with S3_ENDPOINT)
+#   S3_VERIFY_SSL   - Verify S3 TLS certificates (default: false; internal services use cluster CA)
+#   S3_ACCESS_KEY   - S3 access key (bypasses secret lookup in bucket creation)
+#   S3_SECRET_KEY   - S3 secret key (bypasses secret lookup in bucket creation)
+#   SKIP_S3_SETUP   - Skip S3 bucket creation entirely (default: false)
+#   S3_CLI_IMAGE    - Container image with AWS CLI for bucket creation (default: amazon/aws-cli:latest)
 #
 # Examples:
 #   # Default (clean output with successes/warnings/errors only)
@@ -20,11 +29,11 @@
 #
 #   # Quiet (errors only)
 #   LOG_LEVEL=ERROR ./install-helm-chart.sh
+#
+#   # Generic S3 backend (non-ODF)
+#   S3_ENDPOINT=s3.openshift-storage.svc S3_PORT=443 ./install-helm-chart.sh
 
 set -e  # Exit on any error
-
-# Trap to cleanup downloaded charts on script exit
-trap 'cleanup_downloaded_chart' EXIT INT TERM
 
 # Color codes for output
 RED='\033[0;31m'
@@ -46,12 +55,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELM_RELEASE_NAME=${HELM_RELEASE_NAME:-cost-onprem}
 NAMESPACE=${NAMESPACE:-cost-onprem}
 VALUES_FILE=${VALUES_FILE:-}
-REPO_OWNER="insights-onprem"
-REPO_NAME="cost-onprem-chart"
-USE_LOCAL_CHART=${USE_LOCAL_CHART:-false}  # Set to true to use local chart instead of GitHub release
+HELM_REPO_NAME="cost-onprem"
+HELM_REPO_URL="https://insights-onprem.github.io/cost-onprem-chart"
+CHART_VERSION=${CHART_VERSION:-}  # Empty = latest; set to pin a version (e.g., "0.2.9")
+USE_LOCAL_CHART=${USE_LOCAL_CHART:-false}  # Set to true to use local chart instead of Helm repository
 LOCAL_CHART_PATH=${LOCAL_CHART_PATH:-../cost-onprem}  # Path to local chart directory
-STRIMZI_NAMESPACE=${STRIMZI_NAMESPACE:-}  # If set, use existing Strimzi operator in this namespace
-KAFKA_NAMESPACE=${KAFKA_NAMESPACE:-}  # If set, use existing Kafka cluster in this namespace
+KAFKA_NAMESPACE=${KAFKA_NAMESPACE:-}  # If set, look for operator and Kafka cluster in this namespace
 
 # Logging functions with level-based filtering
 log_debug() {
@@ -86,15 +95,32 @@ echo_success() { log_success "$1"; }
 echo_warning() { log_warning "$1"; }
 echo_error() { log_error "$1"; }
 
-# Parse MinIO endpoint: strips protocol and port from FQDN
-# Usage: parse_minio_host "http://minio.ns.svc.cluster.local:80" => "minio.ns.svc.cluster.local"
-parse_minio_host() {
+# Parse S3 endpoint: strips protocol and port from FQDN
+# Usage: parse_s3_host "http://s4.ns.svc.cluster.local:7480" => "s4.ns.svc.cluster.local"
+parse_s3_host() {
     echo "$1" | sed -E 's|^https?://||; s|:[0-9]+/?$||; s|/$||'
 }
 
-# Extract namespace from FQDN: "minio.ns.svc.cluster.local" => "ns"
-parse_minio_namespace() {
-    parse_minio_host "$1" | cut -d. -f2
+# Extract namespace from FQDN: "s4.ns.svc.cluster.local" => "ns"
+parse_s3_namespace() {
+    parse_s3_host "$1" | cut -d. -f2
+}
+
+# Read a value from the user-supplied Helm values file using yq
+# Usage: get_helm_value "database.deploy" "true"
+# Returns the value from VALUES_FILE if set, otherwise returns the default
+get_helm_value() {
+    local key="$1"
+    local default="${2:-}"
+    if [ -n "$VALUES_FILE" ] && [ -f "$VALUES_FILE" ]; then
+        local val
+        val=$(yq e ".$key" "$VALUES_FILE" 2>/dev/null)
+        if [ -n "$val" ] && [ "$val" != "null" ]; then
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default"
 }
 
 # Function to check if a command exists
@@ -210,11 +236,11 @@ create_namespace() {
     echo_info "  This enables the Cost Management Metrics Operator to collect resource optimization data"
 }
 
-# Function to verify Strimzi and Kafka prerequisites
-verify_strimzi_and_kafka() {
-    echo_info "Verifying Strimzi operator and Kafka cluster prerequisites..."
+# Function to verify AMQ Streams and Kafka prerequisites
+verify_kafka() {
+    echo_info "Verifying AMQ Streams operator and Kafka cluster prerequisites..."
 
-    # If user provided external Kafka bootstrap servers, skip verification
+    # If user provided external Kafka bootstrap servers (env var or values file), skip verification
     if [ -n "$KAFKA_BOOTSTRAP_SERVERS" ]; then
         echo_info "Using provided Kafka bootstrap servers: $KAFKA_BOOTSTRAP_SERVERS"
         HELM_EXTRA_ARGS+=("--set" "kafka.bootstrapServers=$KAFKA_BOOTSTRAP_SERVERS")
@@ -222,30 +248,40 @@ verify_strimzi_and_kafka() {
         return 0
     fi
 
+    local values_kafka_bootstrap
+    values_kafka_bootstrap=$(get_helm_value "kafka.bootstrapServers" "")
+    if [ -n "$values_kafka_bootstrap" ]; then
+        echo_info "Using Kafka bootstrap servers from values file: $values_kafka_bootstrap"
+        echo_success "Kafka configuration verified"
+        return 0
+    fi
+
     # Determine which namespace to check
     local check_namespace="${KAFKA_NAMESPACE:-kafka}"
 
-    # Check if Strimzi operator exists
-    local strimzi_ns=""
+    # Check if AMQ Streams operator exists
+    local kafka_ns=""
 
-    # Look for Strimzi operator in any namespace
-    strimzi_ns=$(kubectl get pods -A -l name=strimzi-cluster-operator -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || echo "")
+    # Look for AMQ Streams operator in any namespace
+    kafka_ns=$(kubectl get pods -A -l strimzi.io/kind=cluster-operator -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || echo "")
 
-    if [ -n "$strimzi_ns" ]; then
-        echo_success "Found Strimzi operator in namespace: $strimzi_ns"
-        check_namespace="$strimzi_ns"
+    if [ -n "$kafka_ns" ]; then
+        echo_success "Found AMQ Streams operator in namespace: $kafka_ns"
+        check_namespace="$kafka_ns"
     else
-        echo_error "Strimzi operator not found in cluster"
+        echo_error "AMQ Streams operator not found in cluster"
         echo_info ""
-        echo_info "Strimzi operator is required to manage Kafka clusters."
-        echo_info "Please deploy Strimzi before installing Cost Management On Premise:"
+        echo_info "AMQ Streams operator is required to manage Kafka clusters."
+        echo_info "Please deploy AMQ Streams before installing Cost Management On Premise:"
         echo_info ""
         echo_info "  cd $SCRIPT_DIR"
-        echo_info "  ./deploy-strimzi.sh"
+        echo_info "  ./deploy-kafka.sh"
         echo_info ""
-        echo_info "Or set KAFKA_BOOTSTRAP_SERVERS to use an existing Kafka cluster:"
+        echo_info "Or point to an existing Kafka cluster via env var or values file:"
         echo_info "  export KAFKA_BOOTSTRAP_SERVERS=my-kafka-bootstrap.my-namespace:9092"
         echo_info "  $0"
+        echo_info ""
+        echo_info "  # Or set kafka.bootstrapServers in your values file"
         echo_info ""
         return 1
     fi
@@ -258,7 +294,7 @@ verify_strimzi_and_kafka() {
         echo_info "Please deploy a Kafka cluster before installing Cost Management On Premise:"
         echo_info ""
         echo_info "  cd $SCRIPT_DIR"
-        echo_info "  ./deploy-strimzi.sh"
+        echo_info "  ./deploy-kafka.sh"
         echo_info ""
         return 1
     fi
@@ -274,7 +310,7 @@ verify_strimzi_and_kafka() {
             echo_warning "Kafka cluster is not ready yet. Installation may fail if Kafka is not fully operational."
         fi
 
-        # Import Kafka bootstrap servers if available from deploy-strimzi.sh output
+        # Import Kafka bootstrap servers if available from deploy-kafka.sh output
         if [ -f /tmp/kafka-bootstrap-servers.env ]; then
             source /tmp/kafka-bootstrap-servers.env
             if [ -n "$KAFKA_BOOTSTRAP_SERVERS" ]; then
@@ -289,7 +325,7 @@ verify_strimzi_and_kafka() {
         fi
     fi
 
-    echo_success "Strimzi and Kafka verification completed"
+    echo_success "AMQ Streams and Kafka verification completed"
     return 0
 }
 
@@ -440,102 +476,101 @@ create_storage_credentials_secret() {
         return 0
     fi
 
-    # PRIORITY: If MINIO_ENDPOINT is set, use MinIO credentials (for testing/dev)
-    if [ -n "$MINIO_ENDPOINT" ]; then
-        echo_info "MINIO_ENDPOINT detected: Using MinIO credentials..."
-        local minio_host minio_ns
-        minio_host=$(parse_minio_host "$MINIO_ENDPOINT")
-        minio_ns=$(parse_minio_namespace "$MINIO_ENDPOINT")
+    # PRIORITY: If S3_ENDPOINT is set, look for S4 credentials (for testing/dev)
+    if [ -n "${S3_ENDPOINT:-}" ]; then
+        echo_info "S3_ENDPOINT detected: Looking for credentials..."
+        local s3_ns
+        s3_ns=$(parse_s3_namespace "$S3_ENDPOINT")
 
-        # Try the MinIO namespace first, then the chart namespace
-        for ns in "$minio_ns" "$NAMESPACE"; do
-            if kubectl get secret minio-credentials -n "$ns" >/dev/null 2>&1; then
-                echo_info "Found minio-credentials secret in namespace: $ns"
-                local access_key=$(kubectl get secret minio-credentials -n "$ns" -o jsonpath='{.data.access-key}' | base64 -d)
-                local secret_key=$(kubectl get secret minio-credentials -n "$ns" -o jsonpath='{.data.secret-key}' | base64 -d)
+        # Try the S3 service namespace first, then the chart namespace
+        for ns in "$s3_ns" "$NAMESPACE"; do
+            if kubectl get secret s4-credentials -n "$ns" >/dev/null 2>&1; then
+                echo_info "Found s4-credentials secret in namespace: $ns"
+                local access_key=$(kubectl get secret s4-credentials -n "$ns" -o jsonpath='{.data.access-key}' | base64 -d)
+                local secret_key=$(kubectl get secret s4-credentials -n "$ns" -o jsonpath='{.data.secret-key}' | base64 -d)
                 if [ -n "$access_key" ] && [ -n "$secret_key" ]; then
                     kubectl create secret generic "$secret_name" \
                         --namespace="$NAMESPACE" \
                         --from-literal=access-key="$access_key" \
                         --from-literal=secret-key="$secret_key"
-                    echo_success "Storage credentials created from MinIO credentials (namespace: $ns)"
+                    echo_success "Storage credentials created from S4 credentials (namespace: $ns)"
                     return 0
                 fi
             fi
         done
-        echo_warning "MinIO credentials secret not found in $minio_ns or $NAMESPACE, falling back to default logic..."
+        echo_warning "S4 credentials secret not found in $s3_ns or $NAMESPACE, falling back to default logic..."
     fi
 
-    # OpenShift-only deployment (supports both ODF and MinIO)
-    # Try ODF first, fall back to MinIO for testing/CI environments
-    local odf_secret_name="cost-onprem-odf-credentials"
-    
-    if kubectl get secret "$odf_secret_name" -n "$NAMESPACE" >/dev/null 2>&1; then
-        # Scenario 1: ODF credentials secret exists (created by CI or manually)
-        echo_info "Found existing ODF credentials secret: $odf_secret_name"
-        echo_info "Creating storage credentials secret from ODF credentials..."
-        local access_key=$(kubectl get secret "$odf_secret_name" -n "$NAMESPACE" -o jsonpath='{.data.access-key}')
-        local secret_key=$(kubectl get secret "$odf_secret_name" -n "$NAMESPACE" -o jsonpath='{.data.secret-key}')
+    # OpenShift-only deployment: discover S3 credentials from known sources
+    # Priority: existing S3 credentials secret > NooBaa admin > S4 > fail
+    local s3_creds_secret="cost-onprem-s3-credentials"
+
+    if kubectl get secret "$s3_creds_secret" -n "$NAMESPACE" >/dev/null 2>&1; then
+        # Scenario 1: S3 credentials secret exists (created manually or by prior run)
+        echo_info "Found existing S3 credentials secret: $s3_creds_secret"
+        echo_info "Creating storage credentials from existing secret..."
+        local access_key=$(kubectl get secret "$s3_creds_secret" -n "$NAMESPACE" -o jsonpath='{.data.access-key}')
+        local secret_key=$(kubectl get secret "$s3_creds_secret" -n "$NAMESPACE" -o jsonpath='{.data.secret-key}')
         kubectl create secret generic "$secret_name" \
             --namespace="$NAMESPACE" \
             --from-literal=access-key="$(echo "$access_key" | base64 -d)" \
             --from-literal=secret-key="$(echo "$secret_key" | base64 -d)"
-        echo_success "Storage credentials secret created from ODF credentials"
-        echo_info "  Storage backend: ODF (OpenShift Data Foundation)"
+        echo_success "Storage credentials created from $s3_creds_secret"
     elif kubectl get secret noobaa-admin -n openshift-storage >/dev/null 2>&1; then
-        # Scenario 2: NooBaa admin secret exists (production ODF deployment)
+        # Scenario 2: NooBaa admin secret exists (ODF deployment)
         echo_info "Found noobaa-admin secret in openshift-storage namespace"
-        echo_info "Extracting ODF credentials from NooBaa..."
+        echo_info "Extracting S3 credentials from NooBaa..."
 
         local access_key=$(kubectl get secret noobaa-admin -n openshift-storage -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
         local secret_key=$(kubectl get secret noobaa-admin -n openshift-storage -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
 
-        # Create ODF credentials secret for reference
-        kubectl create secret generic "$odf_secret_name" \
+        # Cache S3 credentials for future runs
+        kubectl create secret generic "$s3_creds_secret" \
             --namespace="$NAMESPACE" \
             --from-literal=access-key="$access_key" \
             --from-literal=secret-key="$secret_key"
-        echo_success "Created ODF credentials secret from noobaa-admin"
+        echo_success "Cached S3 credentials from noobaa-admin"
 
         # Create storage credentials secret
         kubectl create secret generic "$secret_name" \
             --namespace="$NAMESPACE" \
             --from-literal=access-key="$access_key" \
             --from-literal=secret-key="$secret_key"
-        echo_success "Storage credentials secret created from noobaa-admin credentials"
-        echo_info "  Storage backend: ODF (OpenShift Data Foundation)"
-    elif kubectl get secret minio-credentials -n minio >/dev/null 2>&1; then
-        # Scenario 3: MinIO credentials exist (testing/CI environment on OpenShift)
-        echo_info "ODF not detected, checking for MinIO deployment..."
-        echo_info "Found MinIO credentials secret in minio namespace"
-        echo_info "Creating storage credentials secret from MinIO credentials..."
-        
-        local access_key=$(kubectl get secret minio-credentials -n minio -o jsonpath='{.data.access-key}')
-        local secret_key=$(kubectl get secret minio-credentials -n minio -o jsonpath='{.data.secret-key}')
+        echo_success "Storage credentials created from NooBaa"
+        echo_info "  Storage backend: NooBaa (via ODF)"
+    elif kubectl get secret s4-credentials -n "$NAMESPACE" >/dev/null 2>&1; then
+        # Scenario 3: S4 credentials exist (testing/CI environment on OpenShift)
+        echo_info "Found S4 credentials secret in $NAMESPACE namespace"
+
+        local access_key=$(kubectl get secret s4-credentials -n "$NAMESPACE" -o jsonpath='{.data.access-key}')
+        local secret_key=$(kubectl get secret s4-credentials -n "$NAMESPACE" -o jsonpath='{.data.secret-key}')
         kubectl create secret generic "$secret_name" \
             --namespace="$NAMESPACE" \
             --from-literal=access-key="$(echo "$access_key" | base64 -d)" \
             --from-literal=secret-key="$(echo "$secret_key" | base64 -d)"
-        echo_success "Storage credentials secret created from MinIO credentials"
-        echo_info "  Storage backend: MinIO (standalone on OpenShift)"
+        echo_success "Storage credentials created from S4"
+        echo_info "  Storage backend: S4 (Ceph RGW)"
     else
         # Scenario 4: No storage backend found - FAIL
-        echo_error "No storage backend detected!"
+        echo_error "No S3 storage credentials detected!"
         echo_error ""
-        echo_error "This chart requires either ODF (OpenShift Data Foundation) or MinIO for S3-compatible storage."
+        echo_error "This chart requires S3-compatible storage credentials."
         echo_error ""
         echo_info "Available options:"
         echo_info ""
-        echo_info "Option 1: Deploy with ODF (Production - recommended)"
-        echo_info "  - Ensure ODF operator is installed on your OpenShift cluster"
-        echo_info "  - The script will auto-discover credentials from: openshift-storage/noobaa-admin"
-        echo_info "  - Or manually create: kubectl create secret generic cost-onprem-odf-credentials \\"
+        echo_info "Option 1: Provide credentials manually (recommended for generic S3)"
+        echo_info "  kubectl create secret generic $s3_creds_secret \\"
         echo_info "      --namespace=$NAMESPACE \\"
         echo_info "      --from-literal=access-key=<your-access-key> \\"
         echo_info "      --from-literal=secret-key=<your-secret-key>"
+        echo_info "  Then set S3_ENDPOINT=<hostname> when re-running this script."
         echo_info ""
-        echo_info "Option 2: Deploy with MinIO (Testing/CI only)"
-        echo_info "  - First deploy MinIO: ./scripts/deploy-minio-test.sh minio"
+        echo_info "Option 2: Configure in values.yaml (production)"
+        echo_info "  - Set objectStorage.endpoint and objectStorage.secretName"
+        echo_info "  - Pre-create the secret with 'access-key' and 'secret-key' keys"
+        echo_info ""
+        echo_info "Option 3: Deploy with S4 (Testing/CI only)"
+        echo_info "  - First deploy S4: ./scripts/deploy-s4-test.sh cost-onprem"
         echo_info "  - Then re-run this installation script"
         echo_info ""
         echo_error "Deployment aborted. Please configure a storage backend and try again."
@@ -553,6 +588,8 @@ create_storage_credentials_secret() {
 #   S3_ENDPOINT              - Manual S3 endpoint override (e.g., "s3.test.example.com")
 #   S3_ACCESS_KEY            - Manual S3 access key override
 #   S3_SECRET_KEY            - Manual S3 secret key override
+#   S3_CLI_IMAGE             - Container image with AWS CLI (default: amazon/aws-cli:latest)
+#   S3_VERIFY_SSL            - Verify TLS certificates (default: false)
 create_s3_buckets() {
     echo_info "Creating S3 buckets..."
 
@@ -588,31 +625,66 @@ create_s3_buckets() {
     fi
 
     # Determine S3 endpoint and configuration
-    local s3_url mc_insecure
+    # Priority: S3_ENDPOINT env var > NooBaa auto-detect > values.yaml fallback
+    local s3_url no_verify_ssl
 
-    # PRIORITY: If MINIO_ENDPOINT is set, use MinIO (for testing/dev)
-    if [ -n "$MINIO_ENDPOINT" ]; then
-        local minio_host
-        minio_host=$(parse_minio_host "$MINIO_ENDPOINT")
-        s3_url="http://${minio_host}:80"
-        mc_insecure=""
-        echo_info "  ✓ Using MinIO: $s3_url"
+    # Default to skipping verification: most on-prem S3 backends use certs
+    # signed by the cluster service CA, which is not in the container's trust
+    # store.  Set S3_VERIFY_SSL=true when the endpoint has a publicly trusted
+    # certificate (e.g., AWS S3 or a corporate CA in a custom image).
+    local verify_ssl="${S3_VERIFY_SSL:-false}"
+
+    if [ -n "${S3_ENDPOINT:-}" ]; then
+        # PRIORITY 1: Explicit S3_ENDPOINT env var (S4, or any S3 backend)
+        local s3_port="${S3_PORT:-443}"
+        local s3_ssl="${S3_USE_SSL:-true}"
+        if [ "$s3_ssl" = "true" ]; then
+            s3_url="https://${S3_ENDPOINT}:${s3_port}"
+            [ "$verify_ssl" = "true" ] && no_verify_ssl="" || no_verify_ssl="--no-verify-ssl"
+        else
+            s3_url="http://${S3_ENDPOINT}:${s3_port}"
+            no_verify_ssl=""
+        fi
+        echo_info "  ✓ Using S3_ENDPOINT: $s3_url"
     elif kubectl get crd noobaas.noobaa.io >/dev/null 2>&1 && \
        kubectl get noobaa -n openshift-storage >/dev/null 2>&1; then
-        # ODF NooBaa detected
+        # PRIORITY 3: NooBaa auto-detection (ODF S3 backend)
+        # Internal service-serving certs are signed by the cluster CA which
+        # the AWS CLI container does not trust, so verification is skipped.
         s3_url="https://s3.openshift-storage.svc:443"
-        mc_insecure="--insecure"
-        echo_info "  ✓ Detected: ODF (NooBaa S3)"
+        no_verify_ssl="--no-verify-ssl"
+        echo_info "  ✓ Detected: NooBaa S3 (via ODF)"
     else
-        echo_error "Could not detect ODF storage backend"
-        echo_error "Checked for:"
-        echo_error "  - ODF NooBaa CRD in openshift-storage namespace"
-        echo_error ""
-        echo_error "Solutions:"
-        echo_error "  1. Deploy ODF: Ensure OpenShift Data Foundation is properly deployed"
-        echo_error "  2. Manual override: Set MINIO_ENDPOINT environment variable"
-        echo_error "  3. Skip setup: Set SKIP_S3_SETUP=true for CI environments"
-        exit 1
+        # PRIORITY 4: Read objectStorage settings from base values.yaml
+        local chart_dir="${CHART_DIR:-${SCRIPT_DIR}/../cost-onprem}"
+        local base_values="${chart_dir}/values.yaml"
+        local s3_ep="" s3_port="443" s3_ssl="true"
+        if [ -f "$base_values" ] && command_exists yq; then
+            s3_ep=$(yq '.objectStorage.endpoint // ""' "$base_values" 2>/dev/null)
+            s3_port=$(yq '.objectStorage.port // 443' "$base_values" 2>/dev/null)
+            s3_ssl=$(yq '.objectStorage.useSSL // true' "$base_values" 2>/dev/null)
+        fi
+        if [ -n "$s3_ep" ]; then
+            if [ "$s3_ssl" = "true" ]; then
+                s3_url="https://${s3_ep}:${s3_port}"
+                [ "$verify_ssl" = "true" ] && no_verify_ssl="" || no_verify_ssl="--no-verify-ssl"
+            else
+                s3_url="http://${s3_ep}:${s3_port}"
+                no_verify_ssl=""
+            fi
+            echo_info "  ✓ Using S3 from values.yaml: $s3_url"
+        else
+            echo_error "Could not detect S3 storage backend"
+            echo_error "Checked for: S3_ENDPOINT env var, NooBaa CRD, values.yaml objectStorage"
+            echo_error ""
+            echo_error "Solutions:"
+            echo_error "  1. Set S3_ENDPOINT=<hostname> (e.g., S3_ENDPOINT=s3.openshift-storage.svc)"
+            echo_error "     Optional: S3_PORT=443 S3_USE_SSL=true (defaults)"
+            echo_error "  2. Configure objectStorage.endpoint in values.yaml"
+            echo_error "  3. Deploy S4 for dev/test: ./scripts/deploy-s4-test.sh cost-onprem"
+            echo_error "  4. Set SKIP_S3_SETUP=true to skip bucket creation"
+            exit 1
+        fi
     fi
 
     # Read bucket names from values.yaml (single source of truth)
@@ -635,11 +707,20 @@ create_s3_buckets() {
 
     echo_info "Creating buckets at ${s3_url}..."
 
-    # Use kubectl run --rm for one-shot bucket creation (auto-cleanup)
-    # Using UBI9 minimal image (available on OpenShift without Docker Hub rate limits)
-    # Real failures (connectivity, permissions) will cause non-zero exit
-    # Security context overrides required for OpenShift Pod Security Standards
-    local bucket_image="registry.access.redhat.com/ubi9/ubi-minimal:latest"
+    # Use kubectl run --rm for one-shot bucket creation (auto-cleanup).
+    # The image must contain the AWS CLI; override S3_CLI_IMAGE for air-gapped
+    # environments where the default image is mirrored to a private registry.
+    # Real failures (connectivity, permissions) will cause non-zero exit.
+    #
+    # IMPORTANT: --overrides must NOT include a "containers" array.
+    # When --overrides contains "containers", kubectl's strategic merge patch
+    # clobbers the command generated by --command, causing the pod to run
+    # the image default entrypoint which exits immediately without executing
+    # any bucket creation commands.
+    # Pod-level securityContext is sufficient; OpenShift SCC (nonroot-v2)
+    # automatically applies container-level security constraints.
+    # HOME=/tmp lets the AWS CLI write its config without a dedicated volume mount.
+    local bucket_image="${S3_CLI_IMAGE:-amazon/aws-cli:latest}"
     local output
     if output=$(kubectl run bucket-setup --rm -i --restart=Never \
         --image="$bucket_image" \
@@ -652,45 +733,28 @@ create_s3_buckets() {
                     "seccompProfile": {
                         "type": "RuntimeDefault"
                     }
-                },
-                "containers": [{
-                    "name": "bucket-setup",
-                    "image": "'"$bucket_image"'",
-                    "securityContext": {
-                        "allowPrivilegeEscalation": false,
-                        "capabilities": {
-                            "drop": ["ALL"]
-                        },
-                        "runAsNonRoot": true,
-                        "runAsUser": 1001
-                    },
-                    "volumeMounts": [{
-                        "name": "mc-config",
-                        "mountPath": "/.mc"
-                    }]
-                }],
-                "volumes": [{
-                    "name": "mc-config",
-                    "emptyDir": {}
-                }]
+                }
             }
         }' \
-        -- sh -c "
+        --command -- sh -c "
             set -e
-            curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc && chmod +x /tmp/mc
-            export PATH=/tmp:\$PATH
-            mc alias set s3 ${s3_url} '${access_key}' '${secret_key}' ${mc_insecure}
+            export HOME=/tmp
+            export AWS_ACCESS_KEY_ID='${access_key}'
+            export AWS_SECRET_ACCESS_KEY='${secret_key}'
+            export AWS_DEFAULT_REGION=us-east-1  # required by CLI for SigV4 signing; value is ignored by non-AWS S3 backends
+            mkdir -p \$HOME/.aws
+            printf '[default]\ns3 =\n    addressing_style = path\n' > \$HOME/.aws/config
             for bucket in ${bucket_list}; do
-                if mc ls s3/\${bucket} ${mc_insecure} >/dev/null 2>&1; then
+                if aws s3api head-bucket --bucket \${bucket} --endpoint-url ${s3_url} ${no_verify_ssl} 2>/dev/null; then
                     echo \"ℹ️  Bucket \${bucket} already exists\"
                 else
-                    mc mb s3/\${bucket} ${mc_insecure}
+                    aws s3 mb s3://\${bucket} --endpoint-url ${s3_url} ${no_verify_ssl}
                     echo \"✅ Created bucket: \${bucket}\"
                 fi
             done
             echo ''
             echo 'Available buckets:'
-            mc ls s3 ${mc_insecure}
+            aws s3 ls --endpoint-url ${s3_url} ${no_verify_ssl}
         " 2>&1); then
         echo "$output"
         echo_success "S3 buckets ready"
@@ -703,74 +767,91 @@ create_s3_buckets() {
     fi
 }
 
-# Function to download latest chart from GitHub
-download_latest_chart() {
-    echo_info "Downloading latest Helm chart from GitHub..."
+# Function to set up the Helm chart repository
+setup_helm_repo() {
+    echo_info "Setting up Helm chart repository..."
 
-    # Create temporary directory for chart download
-    local temp_dir=$(mktemp -d)
-    local chart_path=""
+    # Add or update the Helm repo
+    if helm repo list 2>/dev/null | grep -q "^${HELM_REPO_NAME}"; then
+        echo_info "Updating existing Helm repo '${HELM_REPO_NAME}'..."
+        helm repo update "${HELM_REPO_NAME}"
+    else
+        echo_info "Adding Helm repo '${HELM_REPO_NAME}' from ${HELM_REPO_URL}..."
+        if ! helm repo add "${HELM_REPO_NAME}" "${HELM_REPO_URL}"; then
+            echo_error "Failed to add Helm repository"
+            echo_info "Verify the repository URL is accessible: ${HELM_REPO_URL}"
+            return 1
+        fi
+        helm repo update "${HELM_REPO_NAME}"
+    fi
 
-    # Get the latest release info from GitHub API
-    echo_info "Fetching latest release information from GitHub..."
-    local latest_release
-    if ! latest_release=$(curl -s "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"); then
-        echo_error "Failed to fetch release information from GitHub API"
-        rm -rf "$temp_dir"
+    # Verify chart is available
+    local search_output
+    if ! search_output=$(helm search repo "${HELM_REPO_NAME}/cost-onprem" --output json 2>/dev/null); then
+        echo_error "Chart 'cost-onprem' not found in repository"
         return 1
     fi
 
-    # Extract the tag name and download URL for the .tgz file
-    local tag_name=$(echo "$latest_release" | jq -r '.tag_name')
-    local download_url=$(echo "$latest_release" | jq -r '.assets[] | select(.name | contains("latest")) | .browser_download_url')
-    local filename=$(echo "$latest_release" | jq -r '.assets[] | select(.name | contains("latest")) | .name')
-
-    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        echo_error "No .tgz file found in the latest release ($tag_name)"
-        echo_info "Available assets:"
-        echo "$latest_release" | jq -r '.assets[].name' | sed 's/^/  - /'
-        rm -rf "$temp_dir"
+    local available_version
+    available_version=$(echo "$search_output" | jq -r '.[0].version // empty')
+    if [ -z "$available_version" ]; then
+        echo_error "No versions of chart 'cost-onprem' found in repository"
         return 1
     fi
-
-    echo_info "Latest release: $tag_name"
-    echo_info "Downloading: $filename"
-    echo_info "From: $download_url"
-
-    # Download the chart
-    if ! curl -L -o "$temp_dir/$filename" "$download_url"; then
-        echo_error "Failed to download chart from GitHub"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-
-    # Verify the download
-    if [ ! -f "$temp_dir/$filename" ]; then
-        echo_error "Downloaded chart file not found: $temp_dir/$filename"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-
-    local file_size=$(stat -c%s "$temp_dir/$filename" 2>/dev/null || stat -f%z "$temp_dir/$filename" 2>/dev/null)
-    echo_success "Downloaded chart: $filename (${file_size} bytes)"
-
-    # Export the chart path for use by deploy_helm_chart function
-    export DOWNLOADED_CHART_PATH="$temp_dir/$filename"
-    export CHART_TEMP_DIR="$temp_dir"
+    echo_success "Helm repo configured. Latest available chart version: ${available_version}"
 
     return 0
 }
 
-# Function to cleanup downloaded chart
-cleanup_downloaded_chart() {
-    if [ -n "$CHART_TEMP_DIR" ] && [ -d "$CHART_TEMP_DIR" ]; then
-        echo_info "Cleaning up downloaded chart..."
-        rm -rf "$CHART_TEMP_DIR"
-        unset DOWNLOADED_CHART_PATH
-        unset CHART_TEMP_DIR
-    fi
-}
 
+# Pre-flight validation: warn about cluster-specific values that could not be
+# auto-detected. These were previously discovered at render time via lookup();
+# now the install script must supply them via --set.
+preflight_validate() {
+    local warnings=0
+
+    echo_info "Pre-flight validation..."
+
+    # Cluster domain (required for Route hostnames)
+    if [ "$PLATFORM" = "openshift" ]; then
+        local cluster_domain
+        cluster_domain=$(oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || true)
+        if [ -z "$cluster_domain" ]; then
+            echo_warning "Could not detect cluster domain (ingress.config.openshift.io/cluster)"
+            echo_info "  Routes will use default 'apps.cluster.local' — override with --set global.clusterDomain=..."
+            warnings=$((warnings + 1))
+        fi
+    fi
+
+    # S3 / Object Storage endpoint
+    if [ "$USER_S3_CONFIGURED" != "true" ] && [ "$USING_EXTERNAL_OBC" != "true" ] && \
+       [ -z "${S3_ENDPOINT:-}" ]; then
+        # NooBaa detection
+        if ! kubectl get crd noobaas.noobaa.io >/dev/null 2>&1 || \
+           ! kubectl get noobaa -n openshift-storage >/dev/null 2>&1; then
+            echo_warning "No S3 backend detected (OBC, S3_ENDPOINT, or NooBaa)"
+            echo_info "  Chart will use default 's3.openshift-storage.svc.cluster.local'"
+            echo_info "  Override with S3_ENDPOINT=<hostname> or --set objectStorage.endpoint=..."
+            warnings=$((warnings + 1))
+        fi
+    fi
+
+    # Keycloak (required for JWT authentication)
+    if [ "$PLATFORM" = "openshift" ] && [ "$KEYCLOAK_FOUND" != "true" ]; then
+        echo_warning "RHBK (Keycloak) not detected — JWT authentication may not work"
+        echo_info "  Deploy RHBK first or override: --set jwtAuth.keycloak.url=..."
+        warnings=$((warnings + 1))
+    fi
+
+    if [ $warnings -gt 0 ]; then
+        echo_warning "Pre-flight: $warnings warning(s) — chart defaults will be used for missing values"
+    else
+        echo_success "Pre-flight validation passed"
+    fi
+
+    # Pre-flight is advisory; always return success
+    return 0
+}
 
 # Function to deploy Helm chart
 deploy_helm_chart() {
@@ -786,26 +867,23 @@ deploy_helm_chart() {
         # Check if Helm chart directory exists
         if [ ! -d "$LOCAL_CHART_PATH" ]; then
             echo_error "Local Helm chart directory not found: $LOCAL_CHART_PATH"
-            echo_info "Set USE_LOCAL_CHART=false to use GitHub releases, or set LOCAL_CHART_PATH to the correct chart location (default: ./cost-onprem)"
+            echo_info "Set USE_LOCAL_CHART=false to use the Helm repository, or set LOCAL_CHART_PATH to the correct chart location (default: ./cost-onprem)"
             return 1
         fi
 
         chart_source="$LOCAL_CHART_PATH"
         echo_info "Using local chart: $chart_source"
     else
-        echo_info "Using GitHub release (USE_LOCAL_CHART=false)"
+        echo_info "Using Helm repository (USE_LOCAL_CHART=false)"
 
-        # Download latest chart if not already downloaded
-        if [ -z "$DOWNLOADED_CHART_PATH" ]; then
-            if ! download_latest_chart; then
-                echo_error "Failed to download latest chart from GitHub"
-                echo_info "Fallback: Set USE_LOCAL_CHART=true to use local chart"
-                return 1
-            fi
+        if ! setup_helm_repo; then
+            echo_error "Failed to set up Helm repository"
+            echo_info "Fallback: Set USE_LOCAL_CHART=true to use local chart"
+            return 1
         fi
 
-        chart_source="$DOWNLOADED_CHART_PATH"
-        echo_info "Using downloaded chart: $chart_source"
+        chart_source="${HELM_REPO_NAME}/cost-onprem"
+        echo_info "Using Helm repository chart: $chart_source"
     fi
 
     # Build Helm command
@@ -814,6 +892,12 @@ deploy_helm_chart() {
     helm_cmd="$helm_cmd --create-namespace"
     helm_cmd="$helm_cmd --timeout=${HELM_TIMEOUT:-600s}"
     helm_cmd="$helm_cmd --wait"
+
+    # Pin chart version if specified (only for Helm repo, not local chart)
+    if [ -n "$CHART_VERSION" ] && [ "$USE_LOCAL_CHART" != "true" ]; then
+        helm_cmd="$helm_cmd --version \"$CHART_VERSION\""
+        echo_info "Pinning chart version: $CHART_VERSION"
+    fi
 
     # Add values file if specified
     if [ -n "$VALUES_FILE" ]; then
@@ -826,24 +910,74 @@ deploy_helm_chart() {
         fi
     fi
 
-    # JWT authentication is auto-enabled on OpenShift via platform detection in Helm templates
-    # Keycloak URL is auto-detected by Helm chart at render time
+    # -------------------------------------------------------------------------
+    # Cluster-detected values (FLPATH-3181: chart no longer uses lookup())
+    # The install script is the single source of truth for cluster-specific
+    # values. All detection that previously happened at Helm render time via
+    # lookup() is now done here and passed via --set.
+    # -------------------------------------------------------------------------
+
+    # Cluster domain (for Route hostnames)
     if [ "$PLATFORM" = "openshift" ]; then
-        echo_info "JWT authentication will be auto-enabled on OpenShift"
-        echo_info "  Keycloak URL will be auto-detected by Helm chart"
-        if [ -n "$KEYCLOAK_URL" ]; then
-            echo_info "  Detected Keycloak: $KEYCLOAK_URL"
+        local cluster_domain
+        cluster_domain=$(oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || true)
+        if [ -n "$cluster_domain" ]; then
+            helm_cmd="$helm_cmd --set global.clusterDomain=\"$cluster_domain\""
+            echo_info "Cluster domain: $cluster_domain"
         fi
-    else
-        echo_info "JWT authentication disabled (non-OpenShift platform)"
     fi
 
-    # Add external OBC configuration to Helm if detected in main()
-    if [ "$USING_EXTERNAL_OBC" = "true" ]; then
+    # Storage class (auto-detect default)
+    local detected_sc
+    detected_sc=$(kubectl get sc -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' 2>/dev/null | awk '{print $1}' || true)
+    if [ -n "$detected_sc" ]; then
+        helm_cmd="$helm_cmd --set global.storageClass=\"$detected_sc\""
+        echo_info "Storage class: $detected_sc"
+    fi
+
+    # Valkey fsGroup (from namespace supplemental-groups annotation)
+    # Only relevant when the chart deploys bundled Valkey
+    local valkey_deploy
+    valkey_deploy=$(get_helm_value "valkey.deploy" "true")
+    if [ "$valkey_deploy" != "false" ] && [ "$PLATFORM" = "openshift" ]; then
+        local supp_groups
+        supp_groups=$(oc get ns "$NAMESPACE" -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}' 2>/dev/null || true)
+        if [ -n "$supp_groups" ]; then
+            # Extract first number from "1000740000/10000" format
+            local fs_group
+            fs_group=$(echo "$supp_groups" | cut -d'/' -f1)
+            if [ -n "$fs_group" ]; then
+                helm_cmd="$helm_cmd --set valkey.securityContext.fsGroup=$fs_group"
+                echo_info "Valkey fsGroup: $fs_group"
+            fi
+        fi
+    fi
+
+    # Keycloak values (chart no longer uses lookup() for Keycloak detection)
+    if [ "$PLATFORM" = "openshift" ] && [ "$KEYCLOAK_FOUND" = "true" ]; then
+        helm_cmd="$helm_cmd --set jwtAuth.keycloak.installed=true"
+        if [ -n "$KEYCLOAK_NAMESPACE" ]; then
+            helm_cmd="$helm_cmd --set jwtAuth.keycloak.namespace=\"$KEYCLOAK_NAMESPACE\""
+        fi
+        if [ -n "$KEYCLOAK_URL" ]; then
+            helm_cmd="$helm_cmd --set jwtAuth.keycloak.url=\"$KEYCLOAK_URL\""
+        fi
+        echo_info "Keycloak: installed=true namespace=$KEYCLOAK_NAMESPACE url=${KEYCLOAK_URL:-auto}"
+    elif [ "$PLATFORM" = "openshift" ]; then
+        echo_warning "RHBK not detected — Keycloak values will use chart defaults"
+    fi
+
+    # S3 endpoint configuration for Helm:
+    # If user pre-configured S3 in values.yaml, skip all --set overrides
+    # (the values file already has the right config).
+    # Otherwise, auto-inject from OBC detection or S3_ENDPOINT.
+    if [ "$USER_S3_CONFIGURED" = "true" ]; then
+        echo_info "S3 configuration provided in values file — skipping Helm --set overrides"
+    elif [ "$USING_EXTERNAL_OBC" = "true" ]; then
         echo_info "Configuring Helm deployment for external OBC (Direct Ceph RGW)"
-        helm_cmd="$helm_cmd --set odf.endpoint=\"$EXTERNAL_OBC_ENDPOINT\""
-        helm_cmd="$helm_cmd --set odf.port=\"$EXTERNAL_OBC_PORT\""
-        helm_cmd="$helm_cmd --set odf.useExternalOBC=true"
+        helm_cmd="$helm_cmd --set objectStorage.endpoint=\"$EXTERNAL_OBC_ENDPOINT\""
+        helm_cmd="$helm_cmd --set objectStorage.port=\"$EXTERNAL_OBC_PORT\""
+        helm_cmd="$helm_cmd --set objectStorage.useSSL=true"
         helm_cmd="$helm_cmd --set ingress.storage.bucket=\"$EXTERNAL_OBC_BUCKET_NAME\""
 
         # Set bucket names for Koku and ROS (via standardized helpers in _helpers.tpl)
@@ -857,19 +991,30 @@ deploy_helm_chart() {
         echo_info "  Endpoint: https://$EXTERNAL_OBC_ENDPOINT:$EXTERNAL_OBC_PORT"
         echo_info "  Bucket: $EXTERNAL_OBC_BUCKET_NAME"
         echo_info "  Bucket configured for ingress, Koku, and ROS components"
+    elif [ -n "${S3_ENDPOINT:-}" ]; then
+        # Explicit S3_ENDPOINT env var (generic S3 backend)
+        local s3_port="${S3_PORT:-443}"
+        local s3_ssl="${S3_USE_SSL:-true}"
+        echo_info "Configuring S3 endpoint from S3_ENDPOINT env var"
+        helm_cmd="$helm_cmd --set objectStorage.endpoint=\"${S3_ENDPOINT}\""
+        helm_cmd="$helm_cmd --set objectStorage.port=${s3_port}"
+        helm_cmd="$helm_cmd --set objectStorage.useSSL=${s3_ssl}"
+        echo_success "✓ S3 endpoint configured: ${S3_ENDPOINT} (port ${s3_port}, SSL=${s3_ssl})"
+    elif kubectl get crd noobaas.noobaa.io >/dev/null 2>&1 && \
+         kubectl get noobaa -n openshift-storage >/dev/null 2>&1; then
+        # NooBaa fallback (ODF S3 backend)
+        echo_info "Configuring S3 endpoint for NooBaa (ODF)"
+        helm_cmd="$helm_cmd --set objectStorage.endpoint=\"s3.openshift-storage.svc\""
+        helm_cmd="$helm_cmd --set objectStorage.port=443"
+        helm_cmd="$helm_cmd --set objectStorage.useSSL=true"
+        echo_success "✓ S3 endpoint configured: s3.openshift-storage.svc (port 443, SSL)"
     fi
 
-    # Add MinIO S3 configuration if specified (for testing/dev with MinIO in OCP)
-    # This sets the generic odf.* values that chart templates actually read.
-    if [ -n "$MINIO_ENDPOINT" ]; then
-        local minio_host
-        minio_host=$(parse_minio_host "$MINIO_ENDPOINT")
-
-        echo_info "Configuring S3 endpoint for MinIO (dev/test)"
-        helm_cmd="$helm_cmd --set odf.endpoint=\"${minio_host}\""
-        helm_cmd="$helm_cmd --set odf.port=80"
-        helm_cmd="$helm_cmd --set odf.useSSL=false"
-        echo_success "✓ S3 endpoint configured: ${minio_host} (port 80, no SSL)"
+    # Tell Helm about the script-managed storage credentials secret so it
+    # skips rendering the placeholder secret template (avoids ownership conflict).
+    if [ -n "$STORAGE_CREDENTIALS_SECRET" ]; then
+        helm_cmd="$helm_cmd --set objectStorage.secretName=\"$STORAGE_CREDENTIALS_SECRET\""
+        echo_info "Storage credentials secret: $STORAGE_CREDENTIALS_SECRET (script-managed)"
     fi
 
     # Add additional Helm arguments passed to the script
@@ -1105,8 +1250,8 @@ cleanup() {
     done
 
     echo_info "Cleaning up Cost Management On Premise deployment..."
-    echo_info "Note: This will NOT remove Strimzi/Kafka. To clean them up separately:"
-    echo_info "  ./deploy-strimzi.sh cleanup"
+    echo_info "Note: This will NOT remove AMQ Streams/Kafka. To clean them up separately:"
+    echo_info "  ./deploy-kafka.sh cleanup"
     echo ""
 
     # Check if namespace exists
@@ -1193,9 +1338,6 @@ cleanup() {
     fi
 
     echo_success "Cleanup completed"
-
-    # Cleanup any downloaded charts
-    cleanup_downloaded_chart
 }
 
 # Function to detect RHBK (Red Hat Build of Keycloak) - OpenShift only
@@ -1576,17 +1718,11 @@ set_platform_config() {
             echo_info "Using OpenShift values file: $openshift_values"
         else
             echo_warning "OpenShift values file not found: $openshift_values"
-            echo_info "Using base values with minimal OpenShift overrides"
-            # Fallback to minimal inline configuration if openshift-values.yaml is missing
-            HELM_EXTRA_ARGS+=(
-                "--set" "global.storageClass=odf-storagecluster-ceph-rbd"
-            )
+            echo_info "Using base values — cluster-specific overrides will be auto-detected"
         fi
     else
         echo_info "Using custom values file: $VALUES_FILE"
     fi
-
-    export KAFKA_ENVIRONMENT="ocp"
 }
 
 # Main execution
@@ -1668,15 +1804,61 @@ main() {
         exit 1
     fi
 
+    # Check if the user has pre-configured S3 storage in their values file.
+    # When objectStorage.endpoint is set, the user manages their own S3
+    # infrastructure and the script skips all S3 auto-detection, credential
+    # creation, and bucket creation.
+    export USER_S3_CONFIGURED="false"
+    export USER_S3_SECRET_NAME=""
+    if [ -n "$VALUES_FILE" ] && [ -f "$VALUES_FILE" ] && command_exists yq; then
+        local user_endpoint
+        user_endpoint=$(yq '.objectStorage.endpoint // ""' "$VALUES_FILE" 2>/dev/null)
+        if [ -n "$user_endpoint" ]; then
+            USER_S3_CONFIGURED="true"
+            USER_S3_SECRET_NAME=$(yq '.objectStorage.secretName // ""' "$VALUES_FILE" 2>/dev/null)
+            echo_info "S3 storage pre-configured in values file:"
+            echo_info "  Endpoint: $user_endpoint"
+            echo_info "  Port: $(yq '.objectStorage.port // 443' "$VALUES_FILE" 2>/dev/null)"
+            echo_info "  SSL: $(yq '.objectStorage.useSSL // true' "$VALUES_FILE" 2>/dev/null)"
+            if [ -n "$USER_S3_SECRET_NAME" ]; then
+                echo_info "  Credentials Secret: $USER_S3_SECRET_NAME (user-managed)"
+            else
+                echo_info "  Credentials Secret: will be created by install script"
+            fi
+            echo_info "Skipping S3 auto-detection"
+        fi
+    fi
+
     # Detect external ObjectBucketClaim (OBC) for Direct Ceph RGW deployments
     # This must happen BEFORE creating storage credentials
+    # Skip if user has already configured S3 in values.yaml
     export USING_EXTERNAL_OBC="false"
-    if [ "$PLATFORM" = "openshift" ]; then
+    if [ "$USER_S3_CONFIGURED" = "false" ] && [ "$PLATFORM" = "openshift" ]; then
         if detect_external_obc "ros-data-ceph" "$NAMESPACE"; then
             USING_EXTERNAL_OBC="true"
             echo_info "Direct Ceph RGW deployment detected via external OBC"
             echo_info "  Storage credentials and bucket creation will be skipped"
         fi
+    fi
+
+    # Determine whether to skip storage credential and bucket creation:
+    #   - USER_S3_CONFIGURED=true + secretName set → skip credentials + buckets
+    #   - USER_S3_CONFIGURED=true + no secretName  → create credentials, skip buckets
+    #   - USING_EXTERNAL_OBC=true                  → skip credentials + buckets (OBC provides both)
+    #   - Otherwise                                → auto-detect and create both
+    local skip_storage_credentials="false"
+    local skip_bucket_creation="false"
+
+    if [ "$USER_S3_CONFIGURED" = "true" ]; then
+        # User manages their S3 — always skip bucket creation
+        skip_bucket_creation="true"
+        if [ -n "$USER_S3_SECRET_NAME" ]; then
+            # User also manages their own credentials secret
+            skip_storage_credentials="true"
+        fi
+    elif [ "$USING_EXTERNAL_OBC" = "true" ]; then
+        skip_storage_credentials="true"
+        skip_bucket_creation="true"
     fi
 
     echo ""
@@ -1685,33 +1867,60 @@ main() {
     echo_info "════════════════════════════════════════════════════════════"
     echo ""
 
-    # Create database credentials secret (always required)
-    if ! create_database_credentials_secret; then
-        echo_error "Failed to create database credentials. Cannot proceed with installation."
-        exit 1
+    # Create database credentials secret (skip when using external database)
+    local database_deploy
+    database_deploy=$(get_helm_value "database.deploy" "true")
+    if [ "$database_deploy" = "false" ]; then
+        echo_info "Skipping database credentials creation (database.deploy=false, using external database)"
+        echo_info "Ensure the database credentials secret already exists in namespace '$NAMESPACE'"
+    else
+        if ! create_database_credentials_secret; then
+            echo_error "Failed to create database credentials. Cannot proceed with installation."
+            exit 1
+        fi
     fi
 
-    # Create storage credentials secret (only if not using external OBC)
-    if [ "$USING_EXTERNAL_OBC" = "false" ]; then
+    # Create storage credentials secret
+    # Track the secret name so we can tell Helm about it via --set objectStorage.secretName
+    # This prevents Helm from trying to create a conflicting placeholder secret.
+    export STORAGE_CREDENTIALS_SECRET=""
+    if [ "$skip_storage_credentials" = "false" ]; then
         if ! create_storage_credentials_secret; then
             echo_error "Failed to create storage credentials. Cannot proceed with installation."
             exit 1
         fi
+        # Compute the same secret name used by create_storage_credentials_secret
+        local chart_name="cost-onprem"
+        local fullname
+        if [[ "$HELM_RELEASE_NAME" == *"$chart_name"* ]]; then
+            fullname="$HELM_RELEASE_NAME"
+        else
+            fullname="${HELM_RELEASE_NAME}-${chart_name}"
+        fi
+        STORAGE_CREDENTIALS_SECRET="${fullname}-storage-credentials"
     else
-        echo_info "Skipping storage credentials creation (using OBC credentials)"
+        if [ -n "$USER_S3_SECRET_NAME" ]; then
+            echo_info "Skipping storage credentials creation (using secret: $USER_S3_SECRET_NAME)"
+        else
+            echo_info "Skipping storage credentials creation (using OBC credentials)"
+        fi
     fi
 
     echo ""
     echo_success "✓ All required secrets created successfully"
     echo ""
 
-    # Create S3 buckets (only if not using external OBC)
-    if [ "$USING_EXTERNAL_OBC" = "false" ]; then
+    # Create S3 buckets
+    if [ "$skip_bucket_creation" = "false" ]; then
         if ! create_s3_buckets; then
             echo_warning "Failed to create S3 buckets. Data storage may not work correctly."
         fi
     else
-        echo_info "Skipping bucket creation (bucket provided by external OBC)"
+        if [ "$USER_S3_CONFIGURED" = "true" ]; then
+            echo_info "Skipping bucket creation (user-managed S3 storage)"
+        else
+            echo_info "Skipping bucket creation (bucket provided by external OBC)"
+        fi
     fi
 
     # Create UI secrets (cookie + OAuth client) - required before helm install
@@ -1735,11 +1944,14 @@ main() {
         echo_warning "Failed to create Django secret. Koku may not start correctly."
     fi
 
-    # Verify Strimzi operator and Kafka cluster are available
-    if ! verify_strimzi_and_kafka; then
-        echo_error "Strimzi/Kafka prerequisites not met"
+    # Verify AMQ Streams operator and Kafka cluster are available
+    if ! verify_kafka; then
+        echo_error "AMQ Streams/Kafka prerequisites not met"
         exit 1
     fi
+
+    # Pre-flight validation (advisory — warns about missing cluster-specific values)
+    preflight_validate
 
     # Deploy Helm chart
     if ! deploy_helm_chart; then
@@ -1775,11 +1987,6 @@ main() {
     echo_success "Cost Management On Prem Helm chart installation completed!"
     echo_info "The services are now running in namespace '$NAMESPACE'"
     echo_info "Next: Run NAMESPACE=$NAMESPACE ./run-pytest.sh to test the deployment"
-
-    # Cleanup downloaded chart if we used GitHub release
-    if [ "$USE_LOCAL_CHART" != "true" ]; then
-        cleanup_downloaded_chart
-    fi
 }
 
 # Handle script arguments
@@ -1809,7 +2016,7 @@ case "${1:-}" in
         echo ""
         echo "Prerequisites:"
         echo "  Before running this installation, ensure you have:"
-        echo "  1. Strimzi operator and Kafka cluster deployed (run ./deploy-strimzi.sh)"
+        echo "  1. AMQ Streams operator and Kafka cluster deployed (run ./deploy-kafka.sh)"
         echo "     OR provide KAFKA_BOOTSTRAP_SERVERS for existing Kafka"
         echo "  2. For OpenShift with JWT auth: RHBK (optional, run ./deploy-rhbk.sh)"
         echo ""
@@ -1817,7 +2024,7 @@ case "${1:-}" in
         echo "  (none)              - Install Cost Management On Premise Helm chart"
         echo "  cleanup             - Delete Helm release and namespace (preserves PVs)"
         echo "  cleanup --complete  - Complete removal including Persistent Volumes"
-        echo "                        Note: Strimzi/Kafka are NOT removed. Use ./deploy-strimzi.sh cleanup"
+        echo "                        Note: AMQ Streams/Kafka are NOT removed. Use ./deploy-kafka.sh cleanup"
         echo "  status              - Show deployment status"
         echo "  health              - Run health checks"
         echo "  help                - Show this help message"
@@ -1831,8 +2038,8 @@ case "${1:-}" in
         echo "Uninstall/Reinstall Workflow:"
         echo "  # For clean reinstall with fresh data:"
         echo "  $0 cleanup --complete    # Remove everything including data volumes"
-        echo "  ./deploy-strimzi.sh cleanup  # Optional: remove Kafka/Strimzi too"
-        echo "  ./deploy-strimzi.sh      # Optional: reinstall Kafka/Strimzi"
+        echo "  ./deploy-kafka.sh cleanup  # Optional: remove AMQ Streams/Kafka too"
+        echo "  ./deploy-kafka.sh      # Optional: reinstall AMQ Streams/Kafka"
         echo "  $0                       # Fresh installation"
         echo ""
         echo "  # For reinstall preserving data:"
@@ -1843,35 +2050,51 @@ case "${1:-}" in
         echo "  HELM_RELEASE_NAME       - Name of Helm release (default: cost-onprem)"
         echo "  NAMESPACE               - Kubernetes namespace (default: cost-onprem)"
         echo "  VALUES_FILE             - Path to custom values file (optional)"
-        echo "  USE_LOCAL_CHART         - Use local chart instead of GitHub release (default: false)"
+        echo "  USE_LOCAL_CHART         - Use local chart instead of Helm repository (default: false)"
         echo "  LOCAL_CHART_PATH        - Path to local chart directory (default: ../cost-onprem)"
+        echo "  CHART_VERSION           - Pin a specific chart version (default: latest)"
         echo "  KAFKA_BOOTSTRAP_SERVERS - Bootstrap servers for existing Kafka (skips verification)"
         echo "                            Example: my-kafka-bootstrap.kafka:9092"
         echo ""
-        echo "S3/ODF Configuration (for CI or custom storage):"
-        echo "  SKIP_S3_SETUP           - Skip S3 bucket creation entirely (default: false)"
-        echo "                            Set to 'true' for CI environments or external S3 management"
-        echo "  S3_ENDPOINT             - Manual S3 endpoint override (bypasses ODF detection)"
-        echo "                            Example: s3.test.example.com"
-        echo "  S3_ACCESS_KEY           - Manual S3 access key (used with S3_ENDPOINT)"
-        echo "  S3_SECRET_KEY           - Manual S3 secret key (used with S3_ENDPOINT)"
+        echo "S3 Storage Configuration:"
+        echo "  Option 1 (Recommended for production): Configure in values.yaml"
+        echo "    Set objectStorage.endpoint, objectStorage.port, objectStorage.useSSL,"
+        echo "    objectStorage.secretName in your values file."
+        echo "    The script skips all S3 auto-detection when objectStorage.endpoint is set."
+        echo ""
+        echo "  Option 2 (Generic S3): Explicit endpoint via environment variable"
+        echo "    S3_ENDPOINT           - S3 endpoint hostname (e.g., s3.openshift-storage.svc)"
+        echo "    S3_PORT               - S3 port (default: 443)"
+        echo "    S3_USE_SSL            - Whether to use TLS (default: true)"
+        echo "    S3_VERIFY_SSL         - Verify TLS certificates (default: false)"
+        echo ""
+        echo "  Option 3 (Automated): Let the script auto-detect"
+        echo "    (OBC auto-detection)  - Detects ObjectBucketClaim 'ros-data-ceph' automatically"
+        echo "    (NooBaa fallback)     - Falls back to NooBaa if available"
+        echo ""
+        echo "  Option 4: Environment variable overrides"
+        echo "    S3_ACCESS_KEY         - Manual S3 access key for credential/bucket creation"
+        echo "    S3_SECRET_KEY         - Manual S3 secret key for credential/bucket creation"
+        echo "    SKIP_S3_SETUP         - Skip S3 bucket creation entirely (default: false)"
         echo ""
         echo "Chart Source Options:"
-        echo "  - Default: Downloads latest release from GitHub (recommended)"
+        echo "  - Default: Installs from Helm chart repository (recommended)"
+        echo "  - Pinned: Set CHART_VERSION={VERSION} to pin a specific chart version"
         echo "  - Local: Set USE_LOCAL_CHART=true to use local chart directory"
         echo "  - Chart Path: Set LOCAL_CHART_PATH to specify custom chart location"
         echo "  - Examples:"
+        echo "    $0                                                     # Install latest from Helm repo"
+        echo "    CHART_VERSION=0.2.9 $0                                 # Install specific version"
         echo "    USE_LOCAL_CHART=true LOCAL_CHART_PATH=../cost-onprem $0"
-        echo "    USE_LOCAL_CHART=true LOCAL_CHART_PATH=../cost-onprem-chart/cost-onprem $0"
         echo ""
         echo "Examples:"
         echo "  # Complete fresh installation"
-        echo "  ./deploy-strimzi.sh                           # Install Strimzi and Kafka first"
+        echo "  ./deploy-kafka.sh                           # Install AMQ Streams and Kafka first"
         echo "  USE_LOCAL_CHART=true LOCAL_CHART_PATH=../cost-onprem $0  # Then install Cost Management On Premise"
         echo ""
-        echo "  # Install from GitHub release (with Strimzi already deployed)"
-        echo "  ./deploy-strimzi.sh                           # Install prerequisites"
-        echo "  $0                                            # Install Cost Management On Premise from latest release"
+        echo "  # Install from Helm repository (with AMQ Streams already deployed)"
+        echo "  ./deploy-kafka.sh                           # Install prerequisites"
+        echo "  $0                                            # Install Cost Management On Premise from Helm repo"
         echo ""
         echo "  # Custom namespace and release name"
         echo "  NAMESPACE=my-namespace HELM_RELEASE_NAME=my-release \\"
@@ -1884,7 +2107,7 @@ case "${1:-}" in
         echo "  USE_LOCAL_CHART=true LOCAL_CHART_PATH=../cost-onprem $0 \\"
         echo "    --set database.ros.storage.size=200Gi"
         echo ""
-        echo "  # Install latest release from GitHub"
+        echo "  # Install latest from Helm repository"
         echo "  $0"
         echo ""
         echo "  # Cleanup and reinstall"
@@ -1894,23 +2117,23 @@ case "${1:-}" in
         echo "  - Automatically detects Kubernetes vs OpenShift"
         echo "  - Uses openshift-values.yaml for OpenShift if available"
         echo "  - Auto-detects optimal storage class for platform"
-        echo "  - Verifies Strimzi operator and Kafka cluster prerequisites"
+        echo "  - Verifies AMQ Streams operator and Kafka cluster prerequisites"
         echo ""
         echo "Deployment Scenarios:"
         echo "  1. Fresh deployment (recommended):"
-        echo "     ./deploy-strimzi.sh    # Deploy Strimzi and Kafka first"
+        echo "     ./deploy-kafka.sh    # Deploy AMQ Streams and Kafka first"
         echo "     $0                     # Deploy Cost Management On Premise"
         echo "     - Auto-detects platform (OpenShift or Kubernetes)"
-        echo "     - Verifies Strimzi/Kafka prerequisites"
+        echo "     - Verifies AMQ Streams/Kafka prerequisites"
         echo "     - Deploys Cost Management On Premise with platform-specific configuration"
         echo ""
         echo "  2. With existing Kafka (external):"
         echo "     KAFKA_BOOTSTRAP_SERVERS=kafka.example.com:9092 $0"
         echo "     - Uses provided Kafka bootstrap servers"
-        echo "     - Skips Strimzi/Kafka verification"
+        echo "     - Skips AMQ Streams/Kafka verification"
         echo ""
         echo "  3. Custom configuration:"
-        echo "     ./deploy-strimzi.sh"
+        echo "     ./deploy-kafka.sh"
         echo "     $0 --set key=value"
         echo "     - Override any Helm value"
         echo "     - Platform detection still applies"

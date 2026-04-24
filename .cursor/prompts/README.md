@@ -7,24 +7,32 @@ These prompt templates help you quickly invoke common actions in Cursor.
 In Cursor, type `@` followed by the prompt name to include it in your conversation:
 
 - `@run-tests` - Run the pytest test suite
+- `@run-iqe-tests` - Run IQE integration tests
+- `@analyze-test-run` - Analyze IQE test run logs for performance and failures
 - `@troubleshoot-tests` - Diagnose test failures
 - `@connect-cluster` - Set up cluster access
 - `@deploy-chart` - Deploy the Helm chart
 - `@check-logs` - View component logs
 - `@debug-e2e` - Debug E2E test failures
 - `@download-ci-artifacts` - Download CI artifacts for debugging
+- `@maintain-pr-summary` - Maintain a running PR summary document
+- `@release-chart` - Cut a new Helm chart release
 
 ## Available Prompts
 
 | Prompt | Purpose |
 |--------|---------|
 | `run-tests.md` | Run pytest with various options (CI mode, extended, specific suites) |
+| `run-iqe-tests.md` | Run IQE integration tests (containerized or local) |
+| `analyze-test-run.md` | Analyze IQE test run logs for performance and failures |
 | `troubleshoot-tests.md` | Diagnose common test failures with specific commands |
 | `connect-cluster.md` | Set up OpenShift cluster access with credentials |
 | `deploy-chart.md` | Deploy the cost-onprem Helm chart |
 | `check-logs.md` | View logs for all cost-onprem components |
 | `debug-e2e.md` | Step-by-step debugging for each E2E test |
 | `download-ci-artifacts.md` | Download CI artifacts from OpenShift CI |
+| `maintain-pr-summary.md` | Maintain a running PR summary as work is developed |
+| `release-chart.md` | Bump chart version and create a release PR |
 
 ## Example Usage
 
@@ -32,6 +40,7 @@ In Cursor, type `@` followed by the prompt name to include it in your conversati
 2. **Troubleshoot**: Type `@troubleshoot-tests` then paste your error
 3. **Connect**: Type `@connect-cluster` then provide your credentials
 4. **Download CI logs**: Type `@download-ci-artifacts` then provide the PR number and build ID
+5. **PR Summary**: Type `@maintain-pr-summary` then ask "Update the PR summary with recent changes"
 
 ## For Claude Code / claude.ai
 

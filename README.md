@@ -18,7 +18,7 @@ Complete Helm chart for deploying the full Cost Management stack with OCP cost a
 
 **📖 Documentation:**
 - **[Cost Management Installation Guide](docs/operations/cost-management-installation.md)** - Complete deployment guide
-- **Prerequisites**: OpenShift 4.18+, ODF with Direct Ceph RGW (150GB+), Kafka/Strimzi
+- **Prerequisites**: OpenShift 4.18+, S3-compatible object storage (ODF, AWS S3, or other), Kafka/AMQ Streams
 - **Architecture**: Single unified chart with all components
 - **E2E Testing**: Automated validation with `./scripts/run-pytest.sh` (pytest-based test suite)
 
@@ -39,17 +39,18 @@ OpenShift Helm chart for deploying the Resource Optimization Service (ROS) with 
 ### OpenShift Deployment
 
 ```bash
-# Install latest release from GitHub
+# Automated installation from Helm repository (recommended)
 ./scripts/install-helm-chart.sh
+
+# Or install a specific chart version
+CHART_VERSION=0.2.9 ./scripts/install-helm-chart.sh
 
 # Or use local chart for development
 USE_LOCAL_CHART=true LOCAL_CHART_PATH=../cost-onprem ./scripts/install-helm-chart.sh
 
-# Or specify custom namespace and release name
-NAMESPACE=my-namespace HELM_RELEASE_NAME=my-release ./scripts/install-helm-chart.sh
-
 # Or use Helm directly
 helm repo add cost-onprem https://insights-onprem.github.io/cost-onprem-chart
+helm repo update
 helm install cost-onprem cost-onprem/cost-onprem --namespace cost-onprem --create-namespace
 ```
 
@@ -77,34 +78,35 @@ helm install cost-onprem cost-onprem/cost-onprem --namespace cost-onprem --creat
 
 ```
 cost-onprem-chart/
-├── cost-onprem/    # Helm chart directory
-│   ├── Chart.yaml             # Chart metadata (v0.2.0)
+├── .github/workflows/         # CI/CD automation
+├── cost-onprem/               # Helm chart directory
+│   ├── Chart.yaml             # Chart metadata
 │   ├── values.yaml            # Default configuration
-│   └── templates/             # Kubernetes resource templates (organized by service)
-│       ├── ros/               # Resource Optimization Service
-│       ├── kruize/            # Kruize optimization engine
-│       ├── cost-management/   # Cost Management (includes Sources API)
-│       ├── ingress/           # API gateway
+│   └── templates/             # Kubernetes resource templates
+│       ├── _helpers*.tpl      # Template helper functions
+│       ├── cost-management/   # Cost Management (Koku, Sources API)
+│       ├── gateway/           # API gateway (Envoy)
 │       ├── infrastructure/    # Database, Kafka, storage, cache
-│       ├── auth/              # Authentication (CA certificates)
+│       ├── ingress/           # File upload API
+│       ├── kruize/            # Kruize optimization engine
 │       ├── monitoring/        # Prometheus ServiceMonitor
+│       ├── ros/               # Resource Optimization Service
 │       ├── shared/            # Shared resources
-│       └── cost-management/   # Future cost management components
-├── tests/                     # Pytest test suite
+│       └── ui/                # Cost Management UI
 ├── docs/                      # Documentation
-├── scripts/                   # Installation and automation scripts
-└── .github/workflows/         # CI/CD automation
+├── scripts/                   # Deployment and automation scripts
+└── tests/                     # Pytest E2E test suite
 ```
 
 ## 📦 Services Deployed
 
 ### Stateful Services
 - **PostgreSQL**: Unified database server hosting ROS, Kruize, Koku, and Sources databases
-- **ODF**: Object storage (OpenShift Data Foundation with NooBaa S3)
+- **S3-compatible object storage**: ODF, AWS S3, or other S3-compatible provider
 
 ### Kafka Infrastructure (Managed by Install Script)
-- **Strimzi Operator**: Deploys and manages Kafka clusters
-- **Kafka 3.8.0**: Message streaming with persistent storage (deployed via Strimzi CRDs)
+- **AMQ Streams Operator**: Deploys and manages Kafka clusters (Streams for Apache Kafka 3.1)
+- **Kafka 4.1.0**: Message streaming with persistent JBOD storage, KRaft mode (no ZooKeeper)
 
 ### Application Services
 - **API Gateway**: Centralized Envoy gateway for JWT authentication and API routing (port 9080)
@@ -142,12 +144,13 @@ Complete Cost Management deployment requires significant cluster resources:
 **📖 See [Resource Requirements Guide](docs/resource-requirements.md) for detailed breakdown by component.**
 
 ### Storage Options
-- **OpenShift**: ODF with Direct Ceph RGW (recommended for strong consistency)
 
-**Note**: Direct Ceph RGW (`ocs-storagecluster-ceph-rgw`) is recommended over NooBaa for ROS deployments due to strong read-after-write consistency requirements. NooBaa has eventual consistency issues that can cause ROS processing failures.
+Any S3-compatible object storage is supported:
+- **ODF with Direct Ceph RGW** (recommended for production - strong read-after-write consistency)
+- **AWS S3** (cloud-hosted)
+- **Other S3-compatible providers**
 
-### Storage Requirements
-- **ODF**: OpenShift Data Foundation with NooBaa (required for S3-compatible storage)
+**Note**: For ROS deployments, providers with strong read-after-write consistency are recommended. NooBaa has eventual consistency issues that can cause ROS processing failures.
 
 **See [Configuration Guide](docs/configuration.md) for detailed requirements**
 
@@ -177,7 +180,7 @@ JWT authentication is **automatically enabled** and requires Keycloak configurat
 # Step 1: Deploy Red Hat Build of Keycloak (RHBK)
 ./scripts/deploy-rhbk.sh
 
-# Step 2: Configure Cost Management Operator with JWT credentials
+# Step 2: Configure Cost Management Metrics Operator with JWT credentials
 ./scripts/setup-cost-mgmt-tls.sh
 
 # Step 3: Deploy Cost Management On-Premise
@@ -190,7 +193,7 @@ Key requirements:
 - ✅ Keycloak realm with `org_id` and `account_number` claims
 - ✅ Service account client credentials
 - ✅ Self-signed CA certificate bundle (auto-configured)
-- ✅ Cost Management Operator configured with JWT token URL
+- ✅ Cost Management Metrics Operator configured with JWT token URL
 
 **Operator Support:**
 - ✅ Red Hat Build of Keycloak (RHBK) v22+ - `k8s.keycloak.org/v2alpha1`
@@ -201,7 +204,7 @@ Key requirements:
 
 ### Deployment
 ```bash
-# Install/upgrade to latest release
+# Install/upgrade from Helm repository
 ./scripts/install-helm-chart.sh
 
 # Check deployment status
@@ -248,8 +251,9 @@ Key requirements:
 
 ### CI/CD Automation
 - **Lint & Validate**: Chart validation on every PR
-- **Automated Releases**: Version-tagged releases with packaged charts
+- **Automated Releases**: Chart-releaser publishes to [Helm repository](https://insights-onprem.github.io/cost-onprem-chart) on version bump
 - **Version Tracking**: `--save-versions` flag generates `version_info.json` for traceability
+- **Disconnected Support**: `oc-mirror` compatible (see [Disconnected Deployment Guide](docs/operations/disconnected-deployment.md))
 
 ## 🚨 Troubleshooting
 
@@ -273,12 +277,13 @@ This project is licensed under the terms specified in the [LICENSE](LICENSE) fil
 
 ## 🛠️ Development Environment
 
-New to this project? See the **[OCP Dev Setup with MinIO](docs/development/ocp-dev-setup-minio.md)** guide to set up a development environment on OpenShift using MinIO instead of ODF. This is the recommended approach for developers who don't have access to a multi-node OCP cluster with ODF.
+New to this project? See the **[OCP Dev Setup with S4](docs/development/ocp-dev-setup-s4.md)** guide to set up a development environment on OpenShift using S4 (Ceph RGW) instead of ODF. This is the recommended approach for developers who don't have access to a multi-node OCP cluster with ODF.
 
 | Setup | Nodes | Storage Backend | Use Case |
 |-------|-------|-----------------|----------|
-| **Dev/Test (MinIO)** | 1 (SNO) | MinIO (standalone) | Local development, testing, demos |
-| **Production (ODF)** | 3+ | ODF with Direct Ceph RGW | Production deployments |
+| **Dev/Test (S4)** | 1 (SNO) | S4 / Ceph RGW (standalone) | Local development, testing, demos |
+| **Production (ODF)** | 3+ | S3-compatible object storage (ODF, AWS S3, or other)
+ | Production deployments |
 
 ## 🤝 Contributing
 

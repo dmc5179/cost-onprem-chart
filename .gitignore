@@ -5,9 +5,10 @@ __pycache__/
 
 # Virtual environments
 venv/
+.venv/
 env/
 ENV/
-.venv/
+.venv-*/
 cost-mgmt-venv/
 *-venv/
 
@@ -15,6 +16,9 @@ cost-mgmt-venv/
 PR*-TRIAGE-*.md
 PR*-QUICK-SUMMARY.md
 PR*-COMMENTS-*.md
+
+# PR summary documents (maintained during development)
+PR-SUMMARY-*.md
 
 # Test logs
 test-logs/
@@ -33,3 +37,5 @@ ci-artifacts-*/
 version_info.json
 .digest-cache/*.digest
 reports/junit.xml
+**/*.json.gz
+debug-exports/**/*

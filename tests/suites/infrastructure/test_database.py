@@ -6,7 +6,7 @@ Tests for database schema validation and migration status.
 
 import pytest
 
-from utils import exec_in_pod, execute_db_query
+from utils import exec_in_pod, execute_db_query, run_oc_command
 
 
 @pytest.mark.infrastructure
@@ -17,7 +17,7 @@ class TestDatabaseSchema:
     def test_api_provider_table_exists(self, cluster_config, database_config):
         """Verify api_provider table exists (core Koku table)."""
         result = execute_db_query(
-            cluster_config.namespace,
+            database_config.namespace,
             database_config.pod_name,
             database_config.database,
             database_config.user,
@@ -31,7 +31,7 @@ class TestDatabaseSchema:
     def test_api_customer_table_exists(self, cluster_config, database_config):
         """Verify api_customer table exists."""
         result = execute_db_query(
-            cluster_config.namespace,
+            database_config.namespace,
             database_config.pod_name,
             database_config.database,
             database_config.user,
@@ -45,7 +45,7 @@ class TestDatabaseSchema:
     def test_manifest_table_exists(self, cluster_config, database_config):
         """Verify cost usage report manifest table exists."""
         result = execute_db_query(
-            cluster_config.namespace,
+            database_config.namespace,
             database_config.pod_name,
             database_config.database,
             database_config.user,
@@ -65,7 +65,7 @@ class TestDatabaseMigrations:
     def test_django_migrations_table_exists(self, cluster_config, database_config):
         """Verify Django migrations table exists."""
         result = execute_db_query(
-            cluster_config.namespace,
+            database_config.namespace,
             database_config.pod_name,
             database_config.database,
             database_config.user,
@@ -79,7 +79,7 @@ class TestDatabaseMigrations:
     def test_migrations_applied(self, cluster_config, database_config):
         """Verify migrations have been applied."""
         result = execute_db_query(
-            cluster_config.namespace,
+            database_config.namespace,
             database_config.pod_name,
             database_config.database,
             database_config.user,
@@ -96,7 +96,7 @@ class TestDatabaseMigrations:
         # This is informational - we just check that the app tables exist
         # which indicates migrations have run
         result = execute_db_query(
-            cluster_config.namespace,
+            database_config.namespace,
             database_config.pod_name,
             database_config.database,
             database_config.user,
@@ -111,6 +111,56 @@ class TestDatabaseMigrations:
         expected_apps = ["api", "reporting", "reporting_common"]
         for app in expected_apps:
             assert app in apps, f"Migrations for '{app}' not found"
+
+    def test_migration_job_completed(self, cluster_config):
+        """Verify database migration job completed successfully.
+        
+        FLPATH-3858: Verify Database Initialization Jobs
+        
+        The koku-migrate job is a Helm pre-install/pre-upgrade hook that runs
+        Django migrations before the application pods start.
+        """
+        # Get the migration job status
+        result = run_oc_command([
+            "get", "job",
+            "-n", cluster_config.namespace,
+            "-l", "app.kubernetes.io/component=cost-management-migration",
+            "-o", "jsonpath={.items[*].status.succeeded}"
+        ], check=False)
+        
+        if result.returncode != 0:
+            pytest.skip("Migration job not found (may be cleaned up by Helm hook policy)")
+        
+        # Check if job completed successfully
+        succeeded = result.stdout.strip()
+        
+        if not succeeded:
+            # Job exists but hasn't completed - check for failures
+            failure_result = run_oc_command([
+                "get", "job",
+                "-n", cluster_config.namespace,
+                "-l", "app.kubernetes.io/component=cost-management-migration",
+                "-o", "jsonpath={.items[*].status.failed}"
+            ], check=False)
+            
+            failed = failure_result.stdout.strip()
+            if failed and int(failed) > 0:
+                pytest.fail(
+                    f"Migration job failed {failed} time(s). "
+                    "Check logs: oc logs -l app.kubernetes.io/component=cost-management-migration"
+                )
+            else:
+                pytest.skip(
+                    "Migration job not completed yet (this is informational - "
+                    "tables already validated in other tests)"
+                )
+        
+        # Job completed - verify it succeeded
+        succeeded_count = int(succeeded) if succeeded else 0
+        assert succeeded_count >= 1, (
+            f"Migration job did not succeed (succeeded={succeeded}). "
+            "Check logs: oc logs -l app.kubernetes.io/component=cost-management-migration"
+        )
 
 
 @pytest.mark.infrastructure
@@ -133,32 +183,32 @@ class TestKruizeDatabase:
         return {"user": user, "password": password}
 
     def test_kruize_experiments_table_exists(
-        self, cluster_config, database_config, kruize_credentials
+        self, cluster_config, kruize_database_config
     ):
         """Verify kruize_experiments table exists."""
         result = execute_db_query(
-            cluster_config.namespace,
-            database_config.pod_name,
-            "costonprem_kruize",
-            kruize_credentials["user"],
+            kruize_database_config.namespace,
+            kruize_database_config.pod_name,
+            kruize_database_config.database,
+            kruize_database_config.user,
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'kruize_experiments')",
-            password=kruize_credentials["password"],
+            password=kruize_database_config.password,
         )
         
         assert result is not None, "Query failed"
         assert result[0][0] in ["t", "True", True, "1"], "kruize_experiments table not found"
 
     def test_kruize_recommendations_table_exists(
-        self, cluster_config, database_config, kruize_credentials
+        self, cluster_config, kruize_database_config
     ):
         """Verify kruize_recommendations table exists."""
         result = execute_db_query(
-            cluster_config.namespace,
-            database_config.pod_name,
-            "costonprem_kruize",
-            kruize_credentials["user"],
+            kruize_database_config.namespace,
+            kruize_database_config.pod_name,
+            kruize_database_config.database,
+            kruize_database_config.user,
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'kruize_recommendations')",
-            password=kruize_credentials["password"],
+            password=kruize_database_config.password,
         )
         
         assert result is not None, "Query failed"

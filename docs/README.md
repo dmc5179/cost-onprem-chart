@@ -15,6 +15,21 @@ docs/
 └── README.md        # This file - documentation index and navigation
 ```
 
+## 📊 Diagrams
+
+Visual overviews of the system architecture, data flows, and key transitions.
+
+| Diagram | Purpose |
+|---------|---------|
+| **[Architecture Overview](cost-onprem-architecture-diagram.svg)** | Component layout of the on-prem deployment |
+| **[SaaS to On-Prem Transition](saas-to-onprem-transition-diagram.svg)** | What changes between SaaS and on-prem |
+| **[Data Processing Flow](data-processing-flow.svg)** | End-to-end data pipeline from operator upload to cost insights |
+| **[Gateway Routing](gateway-routing-diagram.svg)** | Envoy gateway route configuration and request flow |
+| **[UI Login Flow](ui-login-flow.svg)** | OAuth/Keycloak authentication sequence for the UI |
+> **Tip:** These SVGs are also embedded inline in the relevant documentation pages listed below.
+
+---
+
 ## 📚 Documentation Index
 
 Browse documentation by category:
@@ -52,7 +67,7 @@ Deployment, configuration, maintenance, and troubleshooting.
 | **[Resource Requirements](operations/resource-requirements.md)** | Hardware and resource sizing guidance |
 | **[Worker Deployment Scenarios](operations/worker-deployment-scenarios.md)** | Different worker deployment configurations |
 | **[TLS Certificate Options](operations/tls-certificate-options.md)** | Guide to different TLS certificate configuration scenarios |
-| **[Cost Management Operator TLS Config](operations/cost-management-operator-tls-config-setup.md)** | TLS configuration for the Cost Management Metrics Operator |
+| **[Cost Management Metrics Operator TLS Config](operations/cost-management-operator-tls-config-setup.md)** | TLS configuration for the Cost Management Metrics Operator |
 | **[Force Operator Upload](operations/force-operator-upload.md)** | Guide for manually triggering metrics upload for testing |
 | **[Upload Verification Checklist](operations/cost-management-operator-upload-verification-checklist.md)** | Step-by-step checklist to verify operator metrics upload |
 | **[Troubleshooting Guide](operations/troubleshooting.md)** | Common issues and their solutions |
@@ -71,7 +86,7 @@ Testing guides, validation procedures, and development resources.
 
 | Document | Purpose |
 |----------|---------|
-| **[OCP Dev Setup with MinIO](development/ocp-dev-setup-minio.md)** | Set up a dev environment on OCP using MinIO instead of ODF |
+| **[OCP Dev Setup with S4](development/ocp-dev-setup-s4.md)** | Set up a dev environment on OCP using S4 instead of ODF |
 | **[UI OAuth Testing](development/ui-oauth-testing.md)** | Guide for testing UI OAuth flow with Keycloak |
 
 ---
@@ -99,8 +114,8 @@ Testing guides, validation procedures, and development resources.
 4. Use **[TLS Certificate Options](operations/tls-certificate-options.md)** for TLS configuration
 5. Reference **[External Keycloak Scenario](architecture/external-keycloak-scenario.md)** if using external Keycloak
 
-### "I'm setting up the Cost Management Operator"
-1. Follow **[Cost Management Operator TLS Config Setup](operations/cost-management-operator-tls-config-setup.md)**
+### "I'm setting up the Cost Management Metrics Operator"
+1. Follow **[Cost Management Metrics Operator TLS Config Setup](operations/cost-management-operator-tls-config-setup.md)**
 2. Use **[Force Operator Upload](operations/force-operator-upload.md)** to test the upload pipeline
 3. Verify with **[Upload Verification Checklist](operations/cost-management-operator-upload-verification-checklist.md)**
 
@@ -110,7 +125,7 @@ Testing guides, validation procedures, and development resources.
 3. Review logs and debugging steps in relevant setup guides
 
 ### "I'm setting up a development environment"
-1. Follow **[OCP Dev Setup with MinIO](development/ocp-dev-setup-minio.md)** to deploy with MinIO (no ODF required)
+1. Follow **[OCP Dev Setup with S4](development/ocp-dev-setup-s4.md)** to deploy with S4 (no ODF required)
 2. Read **[Installation Guide](operations/installation.md)** for the full install options
 3. Set up authentication using **[Keycloak JWT Authentication Setup](api/keycloak-jwt-authentication-setup.md)**
 

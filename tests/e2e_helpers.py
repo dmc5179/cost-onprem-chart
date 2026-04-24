@@ -189,6 +189,53 @@ def ensure_nise_available() -> bool:
     return install_nise()
 
 
+# Path to NISE templates
+# Default: local templates in tests/data/nise_templates (copied from IQE plugin)
+# Override with NISE_TEMPLATES_DIR env var if needed
+NISE_TEMPLATES_DIR = os.environ.get(
+    "NISE_TEMPLATES_DIR",
+    os.path.join(os.path.dirname(__file__), "data", "nise_templates")
+)
+
+
+def get_nise_template_path(template_name: str) -> Optional[str]:
+    """Get path to a NISE template if available.
+    
+    Templates are pre-configured NISE static reports for various test scenarios.
+    See tests/data/nise_templates/README.md for available templates.
+    
+    Args:
+        template_name: Name of the template file (e.g., "ocp_report_ros_0.yml")
+        
+    Returns:
+        Full path to template if it exists, None otherwise
+    """
+    if not os.path.isdir(NISE_TEMPLATES_DIR):
+        return None
+    
+    template_path = os.path.join(NISE_TEMPLATES_DIR, template_name)
+    if os.path.isfile(template_path):
+        return template_path
+    return None
+
+
+def list_nise_templates() -> List[str]:
+    """List available NISE templates.
+    
+    Returns:
+        List of template filenames, or empty list if templates not available
+    """
+    if not os.path.isdir(NISE_TEMPLATES_DIR):
+        return []
+    
+    return [f for f in os.listdir(NISE_TEMPLATES_DIR) if f.endswith(".yml")]
+
+
+# Aliases for backward compatibility (pending IQE integration)
+get_iqe_template_path = get_nise_template_path
+list_iqe_templates = list_nise_templates
+
+
 def generate_nise_data(
     cluster_id: str,
     start_date: datetime,
@@ -196,6 +243,7 @@ def generate_nise_data(
     output_dir: str,
     config: Optional[NISEConfig] = None,
     include_ros: bool = True,
+    iqe_template: Optional[str] = None,
 ) -> Dict[str, List[str]]:
     """Generate NISE OCP data and return categorized file paths.
     
@@ -206,17 +254,47 @@ def generate_nise_data(
         output_dir: Directory to write output files
         config: NISE configuration (uses defaults if not provided)
         include_ros: Whether to include ROS data (--ros-ocp-info flag)
+        iqe_template: Name of IQE template to use (e.g., "ocp_report_ros_0.yml")
+                     If provided, uses the IQE template instead of generating from config.
+                     Recommended templates:
+                     - "ocp_report_ros_0.yml": ROS optimization testing
+                     - "ocp_report_advanced.yml": Complex multi-node setup
     
     Returns:
         Dict with keys: pod_usage_files, ros_usage_files, node_label_files, namespace_label_files
     """
-    if config is None:
-        config = NISEConfig()
-    
-    yaml_content = config.to_yaml(cluster_id, start_date, end_date)
-    yaml_path = os.path.join(output_dir, "static_report.yml")
-    with open(yaml_path, "w") as f:
-        f.write(yaml_content)
+    # Determine which YAML to use
+    if iqe_template:
+        # Use NISE template
+        template_path = get_nise_template_path(iqe_template)
+        if not template_path:
+            raise FileNotFoundError(
+                f"NISE template '{iqe_template}' not found. "
+                f"Available templates: {list_nise_templates()}"
+            )
+        
+        # Read and modify template to use our dates
+        with open(template_path, "r") as f:
+            yaml_content = f.read()
+        
+        # Replace date placeholders if present
+        yaml_content = yaml_content.replace("start_date: last_month", f"start_date: {start_date.strftime('%Y-%m-%d')}")
+        yaml_content = yaml_content.replace("start_date: today", f"start_date: {start_date.strftime('%Y-%m-%d')}")
+        
+        yaml_path = os.path.join(output_dir, "static_report.yml")
+        with open(yaml_path, "w") as f:
+            f.write(yaml_content)
+        
+        print(f"       Using NISE template: {iqe_template}")
+    else:
+        # Use config-based generation
+        if config is None:
+            config = NISEConfig()
+        
+        yaml_content = config.to_yaml(cluster_id, start_date, end_date)
+        yaml_path = os.path.join(output_dir, "static_report.yml")
+        with open(yaml_path, "w") as f:
+            f.write(yaml_content)
     
     nise_output = os.path.join(output_dir, "nise_output")
     os.makedirs(nise_output, exist_ok=True)
@@ -278,38 +356,17 @@ def generate_nise_data(
 # =============================================================================
 
 def generate_cluster_id(prefix: str = "") -> str:
-    """Generate a unique cluster ID for E2E tests.
-    
-    Args:
-        prefix: Optional prefix to add after the standard e2e-pytest- prefix
-    
-    Returns:
-        Unique cluster ID like "e2e-pytest-cost-val-abc12345"
-    """
-    timestamp = int(time.time())
-    unique = uuid.uuid4().hex[:8]
-    
-    if prefix:
-        return f"{E2E_CLUSTER_PREFIX}{prefix}-{unique}"
-    return f"{E2E_CLUSTER_PREFIX}{timestamp}-{unique}"
+    return str(uuid.uuid4())
 
 
 # =============================================================================
 # Koku API Utilities
 # =============================================================================
 
-def get_koku_api_reads_url(helm_release_name: str, namespace: str) -> str:
-    """Get the internal Koku API reads URL for GET operations."""
+def get_koku_api_url(helm_release_name: str, namespace: str) -> str:
+    """Get the internal Koku API URL for all operations (unified deployment)."""
     return (
-        f"http://{helm_release_name}-koku-api-reads."
-        f"{namespace}.svc.cluster.local:8000/api/cost-management/v1"
-    )
-
-
-def get_koku_api_writes_url(helm_release_name: str, namespace: str) -> str:
-    """Get the internal Koku API writes URL for POST/PUT/DELETE operations."""
-    return (
-        f"http://{helm_release_name}-koku-api-writes."
+        f"http://{helm_release_name}-koku-api."
         f"{namespace}.svc.cluster.local:8000/api/cost-management/v1"
     )
 
@@ -411,8 +468,7 @@ def get_application_type_id(
 def register_source(
     namespace: str,
     pod: str,
-    api_reads_url: str,
-    api_writes_url: str,
+    api_url: str,
     rh_identity_header: str,
     cluster_id: str,
     org_id: str,
@@ -434,8 +490,7 @@ def register_source(
     Args:
         namespace: Kubernetes namespace
         pod: Pod name for executing curl commands (typically ingress pod)
-        api_reads_url: Koku API reads URL
-        api_writes_url: Koku API writes URL
+        api_url: Koku API URL (unified deployment)
         rh_identity_header: Base64-encoded X-Rh-Identity header value
         cluster_id: Cluster ID for the source
         org_id: Organization ID
@@ -448,15 +503,14 @@ def register_source(
     Returns:
         SourceRegistration with source details
     """
-    # Get type IDs using reads endpoint
     source_type_id = get_source_type_id(
-        namespace, pod, api_reads_url, rh_identity_header, container=container
+        namespace, pod, api_url, rh_identity_header, container=container
     )
     if not source_type_id:
         raise RuntimeError("Could not get OpenShift source type ID")
     
     app_type_id = get_application_type_id(
-        namespace, pod, api_reads_url, rh_identity_header, container=container
+        namespace, pod, api_url, rh_identity_header, container=container
     )
     
     # Generate source name using the unique suffix of cluster_id
@@ -486,7 +540,7 @@ def register_source(
             pod,
             [
                 "curl", "-s", "-w", "\n__HTTP_CODE__:%{http_code}", "-X", "POST",
-                f"{api_writes_url}/sources",
+                f"{api_url}/sources",
                 "-H", "Content-Type: application/json",
                 "-H", f"X-Rh-Identity: {rh_identity_header}",
                 "-d", source_payload,
@@ -528,7 +582,7 @@ def register_source(
         raise RuntimeError(
             f"Source creation failed after {max_retries} attempts. "
             f"Last error: {last_error}. "
-            f"pod={pod}, url={api_writes_url}/sources"
+            f"pod={pod}, url={api_url}/sources"
         )
     
     # Create application with cluster_id in extra
@@ -544,7 +598,7 @@ def register_source(
             pod,
             [
                 "curl", "-s", "-X", "POST",
-                f"{api_writes_url}/applications",
+                f"{api_url}/applications",
                 "-H", "Content-Type: application/json",
                 "-H", f"X-Rh-Identity: {rh_identity_header}",
                 "-d", app_payload,
@@ -563,7 +617,7 @@ def register_source(
 def delete_source(
     namespace: str,
     pod: str,
-    api_writes_url: str,
+    api_url: str,
     rh_identity_header: str,
     source_id: str,
     container: str = "ingress",
@@ -573,7 +627,7 @@ def delete_source(
     Args:
         namespace: Kubernetes namespace
         pod: Pod name for executing curl commands (typically ingress pod)
-        api_writes_url: Koku API writes URL
+        api_url: Koku API URL (unified deployment)
         rh_identity_header: Base64-encoded X-Rh-Identity header value
         source_id: ID of the source to delete
         container: Container name in the pod (default: "ingress")
@@ -587,7 +641,7 @@ def delete_source(
             pod,
             [
                 "curl", "-s", "-X", "DELETE",
-                f"{api_writes_url}/sources/{source_id}",
+                f"{api_url}/sources/{source_id}",
                 "-H", f"X-Rh-Identity: {rh_identity_header}",
             ],
             container=container,

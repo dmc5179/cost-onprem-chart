@@ -37,65 +37,63 @@
 
 | Component | Pods | CPU Request | CPU Limit | Memory Request | Memory Limit |
 |-----------|------|-------------|-----------|----------------|--------------|
-| **PostgreSQL** | 1 | 500m | 1000m | 1Gi | 2Gi |
+| **PostgreSQL** | 1 | 100m | 500m | 256Mi | 512Mi |
 | **Valkey** | 1 | 100m | 500m | 256Mi | 512Mi |
-| **Subtotal** | **2** | **600m** | **1.5 cores** | **1.25 GB** | **2.5 GB** |
+| **Subtotal** | **2** | **200m** | **1 core** | **512Mi** | **1Gi** |
 
 #### Application Components
 
 | Component | Pods | CPU Request | CPU Limit | Memory Request | Memory Limit |
 |-----------|------|-------------|-----------|----------------|--------------|
-| **Koku API Reads** | 2 | 300m each | 600m each | 500Mi each | 1Gi each |
-| **Koku API Writes** | 1 | 300m | 600m | 500Mi | 1Gi |
-| **Koku API Listener** | 1 | 200m | 400m | 256Mi | 512Mi |
-| **MASU** | 1 | 300m | 600m | 500Mi | 1Gi |
-| **Celery Beat** | 1 | 100m | 200m | 256Mi | 512Mi |
-| **Celery Workers** | 17 | 100-500m | 200-1000m | 256Mi-1Gi | 512Mi-2Gi |
-| **Subtotal** | **24** | **~6.25 cores** | **~12.5 cores** | **~11.5 GB** | **~23 GB** |
+| **Koku API** | 1 | 250m | 1 | 1Gi | 2Gi |
+| **Koku Listener** | 1 | 150m | 300m | 300Mi | 600Mi |
+| **MASU** | 1 | 250m | 500m | 1Gi | 2Gi |
+| **Celery Beat** | 1 | 50m | 100m | 200Mi | 400Mi |
+| **Celery Workers** | 5 | 100-250m | 200m-500m | 200Mi-1Gi | 400Mi-2Gi |
+| **ROS (API, Processor, Housekeeper, Poller)** | 4 | 500m each | 1 each | 1Gi each | 1Gi each |
+| **Kruize** | 1 | 500m | 1 | 1Gi | 2Gi |
+| **Gateway (Envoy)** | 2 | 100m each | 500m each | 128Mi each | 256Mi each |
+| **Ingress** | 1 | 500m | 1 | 1Gi | 1Gi |
+| **UI** | 1 | 100m | 200m | 128Mi | 256Mi |
+| **Subtotal** | **18** | **~5.0 cores** | **~11 cores** | **~11.8Gi** | **~18.6Gi** |
 
 #### Total Deployment Resources
 
 | Metric | Development | Production |
 |--------|-------------|------------|
-| **Total Pods** | ~24 | 34+ (with replicas) |
-| **Total CPU Request** | **~7.5 cores** | **15+ cores** |
-| **Total CPU Limit** | **~15 cores** | **30+ cores** |
-| **Total Memory Request** | **~16 GB** | **32+ GB** |
-| **Total Memory Limit** | **~28 GB** | **64+ GB** |
-| **Storage (ODF)** | **150 GB** | **300+ GB** |
+| **Total Pods** | ~20 | 27+ (with replicas) |
+| **Total CPU Request** | **~5.2 cores** | **8+ cores** |
+| **Total CPU Limit** | **~12 cores** | **14+ cores** |
+| **Total Memory Request** | **~12.3Gi** | **19+ Gi** |
+| **Total Memory Limit** | **~19.6Gi** | **30+ Gi** |
+| **S3 Object Storage** | **150 GB** | **300+ GB** |
 
-**Note:** Production deployments should scale Koku API reads and Celery workers based on data volume.
+**Note:** These totals exclude Kafka (AMQ Streams), which adds ~7 pods and ~3.2 cores / ~7Gi memory.
 
 ### Required OpenShift Components
 
-#### 1. OpenShift Data Foundation (ODF)
-```bash
-# Verify ODF is installed
-oc get csv -n openshift-storage | grep odf-operator
+#### 1. S3-Compatible Object Storage
 
-# Verify NooBaa (S3-compatible storage) is running
-oc get noobaa -n openshift-storage
+The chart requires S3-compatible object storage. ODF is **not required** — any S3 provider works (AWS S3, ODF with Direct Ceph RGW, S4, etc.).
 
-# Check available storage
-oc get pvc -n openshift-storage
-```
+See the [Storage Configuration](configuration.md#storage-configuration) section for full setup options.
 
-**Minimum ODF Requirements:**
-- **Storage Class:** `ocs-storagecluster-ceph-rbd` or equivalent
-- **Disk Space:** 150GB+ for development (300GB+ for production)
-- **S3 Endpoint:** NooBaa S3 service accessible
-- **Credentials:** Auto-discovered from `noobaa-admin` secret
+**Minimum Requirements:**
+- **S3-compatible endpoint** accessible from the cluster
+- **Credentials** with read/write access to the required buckets
+- **150GB+** for development (300GB+ for production)
 
-#### 2. Kafka / Strimzi
+#### 2. Kafka / AMQ Streams
 
 **Automated Deployment (Recommended):**
 ```bash
-# Deploy Strimzi operator and Kafka cluster
-./scripts/deploy-strimzi.sh
+# Deploy AMQ Streams operator and Kafka cluster (KRaft mode)
+./scripts/deploy-kafka.sh
 
 # Script will:
-# - Install Strimzi operator (version 0.45.1)
-# - Deploy Kafka cluster (version 3.8.0)
+# - Install AMQ Streams operator via OLM (channel: amq-streams-3.1.x)
+# - Deploy Kafka 4.1.0 cluster in KRaft mode (no ZooKeeper)
+# - Create separate controller and broker node pools with persistent JBOD storage
 # - Configure appropriate storage class
 # - Wait for cluster to be ready
 ```
@@ -103,22 +101,23 @@ oc get pvc -n openshift-storage
 **Customization:**
 ```bash
 # Custom namespace
-KAFKA_NAMESPACE=my-kafka ./scripts/deploy-strimzi.sh
+KAFKA_NAMESPACE=my-kafka ./scripts/deploy-kafka.sh
 
 # Custom Kafka cluster name
-KAFKA_CLUSTER_NAME=my-cluster ./scripts/deploy-strimzi.sh
+KAFKA_CLUSTER_NAME=my-cluster ./scripts/deploy-kafka.sh
 
 # For OpenShift with specific storage class
-STORAGE_CLASS=ocs-storagecluster-ceph-rbd ./scripts/deploy-strimzi.sh
+STORAGE_CLASS=ocs-storagecluster-ceph-rbd ./scripts/deploy-kafka.sh
 ```
 
 **Manual Verification:**
 ```bash
-# Check Strimzi operator
-oc get csv -A | grep strimzi
+# Check AMQ Streams operator
+oc get csv -A | grep amqstreams
 
-# Check Kafka cluster
+# Check Kafka cluster and node pools
 oc get kafka -n kafka
+oc get kafkanodepool -n kafka
 
 # Verify Kafka is ready
 oc wait kafka/cost-onprem-kafka --for=condition=Ready --timeout=300s -n kafka
@@ -179,11 +178,11 @@ jq --version
                     └──────────────────────────────┘
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃  STORAGE LAYER (S3/ODF)                                              ┃
+┃  STORAGE LAYER (S3-Compatible Object Storage)                        ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
             ┌─────────────────────────┐
-            │   S3 Storage (NooBaa)   │
+            │   S3 Object Storage     │
             │  • Raw CSV uploads      │
             │  • Processed data       │
             │  • Monthly partitions   │
@@ -196,7 +195,7 @@ jq --version
             └─────────────────────┘
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃  MESSAGE QUEUE (Kafka/Strimzi - deployed separately)                 ┃
+┃  MESSAGE QUEUE (Kafka/AMQ Streams - deployed separately)             ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
             ┌───────────────────────────────┐
@@ -267,8 +266,8 @@ cd /path/to/cost-onprem-chart/scripts
 ```
 
 **What the script does:**
-1. ✅ Verifies pre-requirements (ODF, Kafka)
-2. ✅ Auto-discovers ODF S3 credentials
+1. ✅ Verifies pre-requirements (S3 storage, Kafka)
+2. ✅ Auto-discovers S3 credentials (OBC, NooBaa, S4)
 3. ✅ Creates namespace if needed
 4. ✅ Deploys unified chart (PostgreSQL, Valkey, Koku, ROS, Sources, Kruize)
 5. ✅ Runs database migrations automatically via init container
@@ -276,7 +275,7 @@ cd /path/to/cost-onprem-chart/scripts
 
 **Features:**
 - 🔐 Automatic secret creation (Django, S3)
-- 🔍 Auto-discovers S3 credentials from ODF
+- 🔍 Auto-discovers S3 credentials from cluster (OBC, NooBaa, S4)
 - ✅ Chart validation and linting before deployment
 - 🎯 Pod readiness checks and status reporting
 
@@ -303,8 +302,7 @@ USE_LOCAL_CHART=true ./install-helm-chart.sh
 **Expected Pods:**
 - `cost-onprem-database-0` (StatefulSet, Ready 1/1) - PostgreSQL
 - `cost-onprem-valkey-*` (Deployment, Ready 1/1) - Cache/Broker
-- `cost-onprem-koku-api-reads-*` (Deployment)
-- `cost-onprem-koku-api-writes-*` (Deployment)
+- `cost-onprem-koku-api-*` (Deployment)
 - `cost-onprem-koku-listener-*` (Deployment)
 - `cost-onprem-koku-masu-*` (Deployment)
 - `cost-onprem-celery-*` (Multiple Deployments)
@@ -316,7 +314,7 @@ USE_LOCAL_CHART=true ./install-helm-chart.sh
 oc exec -n $NAMESPACE cost-onprem-database-0 -- psql -U koku -d costonprem_koku -c "SELECT version();"
 
 # Check Koku API health
-oc exec -n $NAMESPACE $(oc get pod -n $NAMESPACE -l app.kubernetes.io/component=cost-management-api-reads -o name | head -1) \
+oc exec -n $NAMESPACE $(oc get pod -n $NAMESPACE -l app.kubernetes.io/component=cost-management-api -o name | head -1) \
   -- python manage.py showmigrations --database=default
 
 # Check Kafka listener
@@ -337,8 +335,7 @@ oc get pods -n $NAMESPACE
 NAME                                            READY   STATUS    RESTARTS   AGE
 cost-onprem-database-0                          1/1     Running   0          5m
 cost-onprem-valkey-*                            1/1     Running   0          5m
-cost-onprem-koku-api-reads-*                    1/1     Running   0          3m
-cost-onprem-koku-api-writes-*                   1/1     Running   0          3m
+cost-onprem-koku-api-*                          1/1     Running   0          3m
 cost-onprem-koku-api-listener-*                 1/1     Running   0          3m
 cost-onprem-koku-api-masu-*                     1/1     Running   0          3m
 cost-onprem-celery-*                            1/1     Running   0          3m
@@ -357,7 +354,7 @@ oc exec -n $NAMESPACE cost-onprem-database-0 -- psql -U koku -d costonprem_koku 
 
 ### 3. Verify S3 Storage
 
-The installation automatically creates the following S3 buckets (for both MinIO and ODF):
+The installation automatically creates the following S3 buckets:
 
 | Bucket | Purpose |
 |--------|---------|
@@ -366,13 +363,12 @@ The installation automatically creates the following S3 buckets (for both MinIO 
 | `insights-upload-perma` | Ingress service for operator uploads |
 
 ```bash
-# Get S3 credentials from ODF
-S3_ENDPOINT=$(oc get route s3 -n openshift-storage -o jsonpath='{.spec.host}')
-S3_ACCESS_KEY=$(oc get secret noobaa-admin -n openshift-storage -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
-S3_SECRET_KEY=$(oc get secret noobaa-admin -n openshift-storage -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+# Get S3 credentials from the storage credentials secret
+S3_ACCESS_KEY=$(kubectl get secret cost-onprem-storage-credentials -n cost-onprem -o jsonpath='{.data.access-key}' | base64 -d)
+S3_SECRET_KEY=$(kubectl get secret cost-onprem-storage-credentials -n cost-onprem -o jsonpath='{.data.secret-key}' | base64 -d)
 
-echo "S3 Endpoint: https://$S3_ENDPOINT"
-echo "Access Key: $S3_ACCESS_KEY"
+# Get the S3 endpoint from Helm values
+S3_ENDPOINT=$(helm get values cost-onprem -n cost-onprem -o json | jq -r '.objectStorage.endpoint // empty')
 
 # Verify buckets were created
 aws s3 ls --endpoint-url https://$S3_ENDPOINT
@@ -411,16 +407,16 @@ The E2E test validates the entire data pipeline:
 ### Running the Test
 
 ```bash
-cd /path/to/cost-onprem-helm-chart/scripts
+cd /path/to/cost-onprem-helm-chart
 
-# Run E2E test (smoke test mode - ~3 minutes)
-./cost-onprem-ocp-dataflow.sh
+# Run all tests (including UI) - ~15 minutes
+NAMESPACE=cost-onprem ./scripts/run-pytest.sh
 
-# Re-run with force cleanup (recommended for repeated runs)
-./cost-onprem-ocp-dataflow.sh --force
+# Run E2E tests only - ~5 minutes
+NAMESPACE=cost-onprem ./scripts/run-pytest.sh --e2e
 
-# Run with diagnostics (shows infrastructure health on failure)
-./cost-onprem-ocp-dataflow.sh --diagnose
+# Run smoke tests only - ~1 minute
+NAMESPACE=cost-onprem ./scripts/run-pytest.sh --smoke
 ```
 
 ### Expected Output
@@ -668,12 +664,13 @@ oc logs -n $NAMESPACE $(oc get pod -n $NAMESPACE -l app=koku-api-listener -o nam
 
 **Solution:**
 ```bash
-# Run test with force cleanup
-./cost-onprem-ocp-dataflow.sh --force
+# Tests automatically clean up before and after runs
+# To force cleanup, set environment variables:
+E2E_CLEANUP_BEFORE=true E2E_CLEANUP_AFTER=true NAMESPACE=cost-onprem ./scripts/run-pytest.sh --e2e
 
 # Or manually clear summary table
 oc exec -n $NAMESPACE cost-onprem-database-0 -- psql -U koku -d costonprem_koku -c \
-  "DELETE FROM org1234567.reporting_ocpusagelineitem_daily_summary WHERE cluster_id = 'test-cluster-123';"
+  "DELETE FROM org1234567.reporting_ocpusagelineitem_daily_summary WHERE cluster_id LIKE 'e2e-%';"
 ```
 
 #### 3. Nise Generates Random Data
@@ -743,7 +740,7 @@ oc exec -n $NAMESPACE $(oc get pod -n $NAMESPACE -l app=koku-worker -o name | he
 
 - **Project Repository:** https://github.com/project-koku
 - **Koku Documentation:** https://koku.readthedocs.io/
-- **Strimzi (Kafka):** https://strimzi.io/
+- **AMQ Streams (Kafka):** https://docs.redhat.com/en/documentation/red_hat_streams_for_apache_kafka/3.1
 
 ### Project Documentation
 
